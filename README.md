@@ -1,10 +1,14 @@
 # manual-duplex
 
-Two-sided printing on a Mac for printers with no duplexer — like the HP Smart Tank 510.
+Two-sided printing on a Mac for printers with no duplexer.
 
 Instead of remembering to open the print dialog, find "Two-sided (Duplex) Printing", pick
 "Print On Both Sides Manually", and hope you reload the paper the right way round, you pick
 one menu item and follow a prompt.
+
+**Free software**, licensed under the [GNU General Public License v3.0 or later](#licence).
+No dependencies beyond what ships with macOS, nothing phones home, and every line of it is
+plain shell you can read.
 
 ![icon](icon.png)
 
@@ -201,6 +205,8 @@ manual-duplex --setup       # pick printer, calibrate
 manual-duplex --calibrate   # redo calibration only
 manual-duplex --config      # open the settings file
 manual-duplex --log         # what happened on recent jobs
+manual-duplex --help        # usage
+manual-duplex --version     # licence information
 
 bash install.sh             # install
 bash install.sh --uninstall # remove everything
@@ -362,6 +368,65 @@ press Print, macOS never ran the item — check that it's executable:
 ```bash
 ls -l ~/Library/PDF\ Services/
 ```
+
+## Licence
+
+Copyright (C) 2026 Yasas Alwis
+
+This program is free software: you can redistribute it and/or modify it under the terms of
+the **GNU General Public License** as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but **WITHOUT ANY
+WARRANTY**; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program.
+If not, see <https://www.gnu.org/licenses/>.
+
+### Adding the LICENSE file
+
+The full licence text is **not** bundled in this repository yet. Fetch the official copy
+rather than pasting one from anywhere else — a subtly altered licence is not the GPL:
+
+```bash
+curl -o LICENSE https://www.gnu.org/licenses/gpl-3.0.txt
+```
+
+Verify it: the file should be 674 lines and start with `GNU GENERAL PUBLIC LICENSE` /
+`Version 3, 29 June 2007`.
+
+The GPL requires that the full text accompany any copy you distribute, so add this before
+publishing the repository or handing the folder to anyone.
+
+### What GPL v3 means here
+
+- **You can** use it, read it, modify it and share it, commercially or not.
+- **You must** keep the copyright and licence notices, state what you changed, and make
+  your source available under the same licence if you distribute a modified version.
+- **There is no warranty.** It drives a printer and consumes paper; read the code before
+  trusting it with a 200-page job.
+
+Every source file carries the standard GPL notice in its header.
+
+## Contributing
+
+It's plain `bash` plus a small AppleScript launcher — no build step, no toolchain.
+
+```bash
+bash -n manual-duplex.sh install.sh   # syntax check
+bash install.sh                       # install your working copy
+~/.local/bin/manual-duplex --doctor   # verify the install end to end
+```
+
+Two test documents are included: `duplex-test-4-pages.pdf` for the straightforward case and
+`duplex-test-3-pages.pdf` for the odd-page path, which is where the interesting bugs live.
+The engine writes a detailed log to `~/.config/manual-duplex/manual-duplex.log` — please
+include the relevant part when reporting a problem, since almost every issue in this tool's
+history was diagnosed from it.
+
+Note that `manual-duplex.sh` targets **bash 3.2**, the version macOS ships. No `mapfile`, no
+associative arrays, and mind that expanding an empty array under `set -u` is an error there.
 
 ## Known limits
 

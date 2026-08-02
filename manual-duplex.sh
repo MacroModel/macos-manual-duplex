@@ -2,6 +2,21 @@
 #
 # manual-duplex - two-sided printing for printers without a duplexer
 #
+# Copyright (C) 2026 Yasas Alwis
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
 # Invoked as a macOS PDF Service (from the PDF dropdown in any print dialog),
 # or directly:   manual-duplex.sh [--calibrate|--setup|--config] [file.pdf]
 #
@@ -962,6 +977,27 @@ doctor() {
   echo
 }
 
+usage() {
+  cat <<'USAGE'
+manual-duplex - two-sided printing for printers without a duplexer
+
+  manual-duplex FILE.pdf     print a PDF two-sided
+  manual-duplex --setup      pick printer, then calibrate
+  manual-duplex --calibrate  redo calibration only
+  manual-duplex --printer    switch printer
+  manual-duplex --status     show current settings
+  manual-duplex --doctor     diagnose "nothing happened when I pressed Print"
+  manual-duplex --config     open the settings file
+  manual-duplex --log        show recent job history
+  manual-duplex --version    licence information
+
+Normally you do not run this by hand: print from any app and choose
+"Print Two-Sided" from the PDF dropdown in the print dialog.
+
+Free software under the GNU GPL v3 or later, with NO WARRANTY.
+USAGE
+}
+
 status() {
   local first="back sides (evens) first"
   [ "$PASS_ORDER" = "odds-first" ] && first="front sides (odds) first"
@@ -1004,7 +1040,8 @@ case "${1:-}" in
   --doctor)    doctor; exit 0 ;;
   --config)    open -t "$CONFIG" 2>/dev/null || cat "$CONFIG"; exit 0 ;;
   --log)       cat "$LOG"; exit 0 ;;
-  --help|-h)   sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --help|-h)   usage; exit 0 ;;
+  --version)   echo "manual-duplex - GPL-3.0-or-later - https://www.gnu.org/licenses/"; exit 0 ;;
 esac
 
 # macOS invokes a PDF Service tool with exactly three parameters:
