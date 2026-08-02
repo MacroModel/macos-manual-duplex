@@ -1,6 +1,6 @@
 # manual-duplex
 
-Two-sided printing on a Mac for printers with no duplexer — like the HP Smart Tank 510.
+Two-sided printing on a Mac for printers with no duplexer.
 
 Instead of remembering to open the print dialog, find "Two-sided (Duplex) Printing", pick
 "Print On Both Sides Manually", and hope you reload the paper the right way round, you pick
