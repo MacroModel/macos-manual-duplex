@@ -18,6 +18,8 @@ BIN_DIR="${HOME}/.local/bin"
 ENGINE="${BIN_DIR}/manual-duplex"
 SERVICES="${HOME}/Library/PDF Services"
 SERVICE="${SERVICES}/Print Two-Sided"
+APP_DIR="${HOME}/Applications"
+APP="${APP_DIR}/Two-Sided Printing.app"
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 warn()  { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -37,20 +39,37 @@ fi
 
 # Reject stray arguments rather than silently ignoring them.
 case "${1:-}" in
-  ""|--no-queues|--uninstall) ;;
+  ""|--no-queues|--with-queues|--uninstall) ;;
   *) die "Unknown option: $1
 
 Usage:
-  bash install.sh              install PDF Service + helper queues
-  bash install.sh --no-queues  install the PDF Service only
-  bash install.sh --uninstall  remove everything" ;;
+  bash install.sh               install the PDF Service (no password needed)
+  bash install.sh --with-queues also add the helper printer queues (needs sudo)
+  bash install.sh --uninstall   remove everything" ;;
 esac
 
 # ---------------------------------------------------------------------------
 
+# An earlier version of this installer handed jobs off with `launchctl submit`.
+# Those jobs persist in the user's launchd domain and get respawned, and because
+# the PDF they reference is deleted once the job finishes, each respawn pops a
+# "No PDF was handed to Two-Sided Printing" dialog out of nowhere. Clear them.
+clear_stale_launchd_jobs() {
+  local j found=0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  while read -r j; do
+    [ -z "$j" ] && continue
+    launchctl remove "$j" 2>/dev/null && found=1
+  done < <(launchctl list 2>/dev/null | awk '/manualduplex/ {print $3}')
+  [ "$found" -eq 1 ] && green "Removed stale launchd jobs from a previous version"
+  return 0
+}
+
 uninstall() {
-  rm -f "$SERVICE" && green "Removed PDF Service"
-  rm -f "$ENGINE"  && green "Removed $ENGINE"
+  clear_stale_launchd_jobs
+  rm -f "$SERVICE"    && green "Removed PDF Service"
+  rm -rf "$APP"       && green "Removed $APP"
+  rm -f "$ENGINE"     && green "Removed $ENGINE"
   local q
   for q in $(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -- '-Two-Sided-' || true); do
     if lpadmin -x "$q" 2>/dev/null; then
@@ -69,6 +88,8 @@ uninstall() {
 [ "$(uname)" = "Darwin" ] || die "This installs a macOS print workflow; it only runs on macOS."
 
 # --- 1. the engine -----------------------------------------------------------
+
+clear_stale_launchd_jobs
 
 mkdir -p "$BIN_DIR"
 cp "$ENGINE_SRC" "$ENGINE"
@@ -92,9 +113,50 @@ else
   warn "No icon.iconset found - prompts will use the default macOS icon."
 fi
 
+# --- 1c. the launcher app ----------------------------------------------------
+# Since Big Sur the printtool process that runs PDF Services is sandboxed:
+# scripts placed there cannot reliably write files or spawn processes, and fail
+# silently. Printing from a sandboxed app such as Preview hits this hardest.
+#
+# An app launched through LaunchServices runs in the normal user session, so the
+# PDF Service script does the one thing it is still allowed to do - `open -a`
+# this app - and the app does the real work.
+
+if [ -f "${SRC_DIR}/app.applescript" ] && command -v osacompile >/dev/null 2>&1; then
+  mkdir -p "$APP_DIR"
+  rm -rf "$APP"
+  if osacompile -o "$APP" "${SRC_DIR}/app.applescript" 2>/dev/null; then
+    PLIST="${APP}/Contents/Info.plist"
+    PB=/usr/libexec/PlistBuddy
+    if [ -x "$PB" ]; then
+      # No Dock icon, and accept PDFs so the open event is delivered.
+      "$PB" -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null || \
+        "$PB" -c "Set :LSUIElement true" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Set :CFBundleIdentifier com.manualduplex.twosided" "$PLIST" 2>/dev/null || \
+        "$PB" -c "Add :CFBundleIdentifier string com.manualduplex.twosided" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Add :CFBundleDocumentTypes array" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string PDF" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" "$PLIST" 2>/dev/null || true
+      "$PB" -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string com.adobe.pdf" "$PLIST" 2>/dev/null || true
+    fi
+    [ -f "${CONFIG_DIR}/manual-duplex.icns" ] && \
+      cp "${CONFIG_DIR}/manual-duplex.icns" "${APP}/Contents/Resources/applet.icns" 2>/dev/null || true
+    # Register with LaunchServices so `open -a` finds it immediately.
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+      -f "$APP" >/dev/null 2>&1 || true
+    green "Installed app     -> $APP"
+  else
+    warn "Could not compile the launcher app. Printing from sandboxed apps"
+    warn "(Preview, TextEdit, Pages) may silently do nothing."
+  fi
+else
+  warn "osacompile or app.applescript missing - skipping the launcher app."
+fi
+
 # --- 2. the PDF Service ------------------------------------------------------
-# An executable in ~/Library/PDF Services appears in the PDF dropdown of every
-# app's print dialog. macOS hands it the spooled PDF as an argument.
+# Deliberately minimal: it runs inside printtool's sandbox, so it does as little
+# as possible and hands off immediately.
 
 mkdir -p "$SERVICES"
 cat >"$SERVICE" <<EOF
@@ -102,43 +164,28 @@ cat >"$SERVICE" <<EOF
 #
 # macOS PDF Service entry point for manual-duplex.
 #
-# This wrapper must return immediately. The print system expects a PDF Service
-# tool to consume the spool file and exit; the two-pass duplex flow blocks for
-# minutes waiting for the paper to be flipped, and holding the workflow open
-# that long makes macOS abandon it with "Error running print workflow".
-#
-# So: take our own copy of the spool file, hand it to the engine as a detached
-# background process, and exit 0 straight away.
-
-set -u
+# This script runs inside printtool's sandbox, which since Big Sur blocks
+# writing files and spawning processes. Anything ambitious here fails silently -
+# no error, no output, nothing printed. That is why it does almost nothing:
+# stash the CUPS options next to the spool file (best effort - the sandbox often
+# refuses, and losing them only costs the quality/colour passthrough), then hand
+# the PDF to the launcher app through LaunchServices, which runs outside the
+# sandbox and does the real work.
 
 TITLE="\${1:-Document}"
 OPTS="\${2:-}"
 SPOOL="\${3:-}"
 
-WORK="\$HOME/.config/manual-duplex/jobs"
-LOGF="\$HOME/.config/manual-duplex/manual-duplex.log"
-mkdir -p "\$WORK"
+[ -n "\$SPOOL" ] && [ -f "\$SPOOL" ] || exit 0
 
-# Older spool files from abandoned jobs should not accumulate.
-find "\$WORK" -name '*.pdf' -mtime +7 -delete 2>/dev/null || true
+printf '%s' "\$OPTS" > "\${SPOOL}.mdopts" 2>/dev/null || true
 
-if [ -z "\$SPOOL" ] || [ ! -f "\$SPOOL" ]; then
-  echo "\$(date '+%Y-%m-%d %H:%M:%S')  wrapper: no spool file in args: \$*" >>"\$LOGF"
-  exit 0
+if ! /usr/bin/open -a "$APP" "\$SPOOL" 2>/dev/null; then
+  # LaunchServices refused. Try the engine directly - works from apps that are
+  # not sandboxed, which at least keeps those printing.
+  ( ( nohup "$ENGINE" "\$TITLE" "\$OPTS" "\$SPOOL" \
+        >>"\$HOME/.config/manual-duplex/manual-duplex.log" 2>&1 & ) & )
 fi
-
-COPY="\$WORK/\$(date +%Y%m%d-%H%M%S)-\$\$.pdf"
-if ! cp "\$SPOOL" "\$COPY" 2>>"\$LOGF"; then
-  echo "\$(date '+%Y-%m-%d %H:%M:%S')  wrapper: could not copy spool file" >>"\$LOGF"
-  exit 0
-fi
-
-# Apple's docs: the tool is responsible for removing the spooled PDF.
-rm -f "\$SPOOL"
-
-nohup "$ENGINE" "\$TITLE" "\$OPTS" "\$COPY" >>"\$LOGF" 2>&1 &
-disown 2>/dev/null || true
 
 exit 0
 EOF
@@ -147,30 +194,53 @@ green "Installed service -> PDF dropdown item \"Print Two-Sided\""
 
 # --- 3. helper queues --------------------------------------------------------
 
-if [ "${1:-}" != "--no-queues" ]; then
+# The helper queues are opt-in. They are the one part of this that needs an
+# admin password, and the one part whose behaviour is not verified: they rely on
+# the CUPS page-set option, which driverless queues often ignore. The PDF Service
+# is the path that actually works, and it needs no password at all.
+if [ "${1:-}" = "--with-queues" ]; then
   echo
-  echo "Optional: add two entries to your printer list so you can drive this"
+  echo "Adding two entries to your printer list so you can drive this"
   echo "straight from the Printer menu instead of the PDF dropdown."
   echo
 
+  # Ask for credentials once, up front, on the real terminal. sudo reads its
+  # prompt from the tty; if the installer is run without one - piped, or from an
+  # editor's run button - the prompt appears and is immediately fed EOF, so it
+  # looks like it "didn't wait for the password" and carried on.
+  SKIP_QUEUES=0
+  if [ ! -e /dev/tty ]; then
+    warn "No terminal available for the password prompt - skipping helper queues."
+    warn "Run 'bash install.sh --with-queues' directly in Terminal to add them."
+    SKIP_QUEUES=1
+  elif ! sudo -v </dev/tty; then
+    warn "Could not get admin rights - skipping helper queues."
+    warn "The PDF Service is installed and works without them."
+    SKIP_QUEUES=1
+  fi
+
   # No mapfile here: macOS ships bash 3.2, which predates it.
   QUEUES=""
-  while IFS= read -r q; do
-    [ -n "$q" ] && QUEUES="${QUEUES}${q}"$'\n'
-  done < <(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -v -- '-Two-Sided-' || true)
+  if [ "$SKIP_QUEUES" -eq 0 ]; then
+    while IFS= read -r q; do
+      [ -n "$q" ] && QUEUES="${QUEUES}${q}"$'\n'
+    done < <(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -v -- '-Two-Sided-' || true)
+  fi
 
   if [ -z "$QUEUES" ]; then
-    warn "No printers found - skipping helper queues."
+    [ "$SKIP_QUEUES" -eq 0 ] && warn "No printers found - skipping helper queues."
   else
     QCOUNT=$(printf '%s' "$QUEUES" | grep -c . || true)
     if [ "$QCOUNT" -eq 1 ]; then
       BASE=$(printf '%s' "$QUEUES" | head -n1)
     else
       echo "Which printer?"
+      # Read from the terminal, not stdin: stdin may be a pipe or already
+      # consumed, in which case select would EOF instantly and pick nothing.
       # shellcheck disable=SC2086
       select BASE in $QUEUES "skip"; do
         [ -n "${BASE:-}" ] && break
-      done
+      done </dev/tty
       [ "$BASE" = "skip" ] && BASE=""
     fi
 
@@ -222,6 +292,10 @@ cat <<'EOF'
 
 How to use it
 -------------
+  Helper printer queues were not installed - they need an admin password and
+  rely on a CUPS option many printers ignore. Add them with:
+      bash install.sh --with-queues
+
   In any app:  File > Print > PDF dropdown (bottom-left) > Print Two-Sided
   Follow the prompt, flip the stack when asked, done.
 

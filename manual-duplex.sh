@@ -63,19 +63,40 @@ dialog() {
   else
     script="display dialog \"$text\" buttons {\"$b1\"} default button \"$b1\" with title \"$APP_NAME\" $ICON_CLAUSE"
   fi
-  # `activate` matters: System Events is a faceless background app, so without
-  # it the dialog can open behind the document window you just printed from -
-  # the job looks stalled and the prompt is nowhere to be seen.
-  osascript -e 'tell application "System Events"' -e 'activate' -e "$script" -e 'end tell' 2>/dev/null \
-    | sed 's/.*button returned://; s/,.*//'
+  # Two things are load-bearing here:
+  #
+  # `activate` - System Events is a faceless background app, so without it the
+  # dialog can open behind the document window you just printed from.
+  #
+  # `with timeout` - talking to System Events is an Apple Event, and those time
+  # out after 120 seconds by default. Without this the prompt silently vanishes
+  # two minutes in, which is easy to hit while you are hunting for a blank sheet.
+  local raw
+  raw=$(osascript -e 'tell application "System Events"' -e 'activate' \
+                  -e 'with timeout of 86400 seconds' \
+                  -e "$script" \
+                  -e 'end timeout' -e 'end tell' 2>&1)
+
+  # Never swallow osascript's error text. A dialog that fails to appear at all
+  # is almost always an AppleScript compile error in the message, and without
+  # this the only symptom is silence.
+  case "$raw" in
+    *"button returned"*)
+      printf '%s' "$raw" | sed 's/.*button returned://; s/,.*//'
+      ;;
+    *)
+      log "dialog failed: ${raw:-<no output>}"
+      ;;
+  esac
 }
 
 alert() {
   local text="$1"
   text="${text//\\/\\\\}"; text="${text//\"/\\\"}"
   osascript -e 'tell application "System Events"' -e 'activate' \
+            -e 'with timeout of 86400 seconds' \
             -e "display dialog \"$text\" buttons {\"OK\"} default button \"OK\" with title \"$APP_NAME\" $ICON_CLAUSE" \
-            -e 'end tell' >/dev/null 2>&1
+            -e 'end timeout' -e 'end tell' >/dev/null 2>&1
 }
 
 choose_from() {
@@ -85,8 +106,9 @@ choose_from() {
   for i in "$@"; do list+="\"${i//\"/\\\"}\", "; done
   list="${list%, }"
   osascript -e 'tell application "System Events"' -e 'activate' \
+    -e 'with timeout of 86400 seconds' \
     -e "choose from list {$list} with prompt \"${prompt//\"/\\\"}\" with title \"$APP_NAME\"" \
-    -e 'end tell' 2>/dev/null
+    -e 'end timeout' -e 'end tell' 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -223,29 +245,51 @@ Add your printer in System Settings > Printers & Scanners, then run setup again.
 page_count() {
   local f="$1" n=""
 
-  # 1. PDFKit via JavaScript for Automation. Present on every modern macOS.
-  n=$(osascript -l JavaScript <<'JXA' "$f" 2>/dev/null
+  # 1. PDFKit / CoreGraphics via JavaScript for Automation.
+  #
+  # The "-" is load-bearing: osascript treats its first non-option argument as
+  # the program file, so without it osascript tries to execute the PDF itself as
+  # a script and never reads the heredoc at all.
+  n=$(osascript -l JavaScript - "$f" 2>/dev/null <<'JXA'
 function run(argv) {
   ObjC.import('Quartz');
   var url = $.NSURL.fileURLWithPath(argv[0]);
-  var doc = $.PDFDocument.alloc.initWithURL(url);
-  if (!doc || doc.isNil()) { return ''; }
-  return String(doc.pageCount);
+  try {
+    var doc = $.PDFDocument.alloc.initWithURL(url);
+    if (doc && !doc.isNil() && doc.pageCount > 0) { return String(doc.pageCount); }
+  } catch (e) {}
+  try {
+    var cg = $.CGPDFDocumentCreateWithURL(url);
+    if (cg) {
+      var n = $.CGPDFDocumentGetNumberOfPages(cg);
+      if (n > 0) { return String(n); }
+    }
+  } catch (e) {}
+  return '';
 }
 JXA
   )
   case "$n" in ''|*[!0-9]*) n="" ;; esac
   [ -n "$n" ] && [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
+  log "page_count: JXA returned nothing for $f"
 
-  # 2. Spotlight metadata. Often unavailable for files in /var/folders.
+  # 2. Spotlight metadata. Usually unavailable here - our jobs folder lives
+  # under a dot-directory, which Spotlight does not index - but it is free.
   n=$(mdls -raw -name kMDItemNumberOfPages "$f" 2>/dev/null)
   case "$n" in ''|*[!0-9]*) n="" ;; esac
   [ -n "$n" ] && [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
 
+  # 3. Read the page tree out of the PDF itself. Works on uncompressed page
+  # trees; returns nothing when the document uses object streams.
+  n=$(LC_ALL=C grep -a -o '/Type[[:space:]]*/Page[^s]' "$f" 2>/dev/null | wc -l | tr -d ' ')
+  case "$n" in ''|*[!0-9]*) n="" ;; esac
+  [ -n "$n" ] && [ "$n" -gt 0 ] && { log "page_count: fell back to raw scan ($n)"; printf '%s' "$n"; return 0; }
+
   # 3. Ask the user rather than guessing wrong and wasting a stack of paper.
   n=$(osascript -e 'tell application "System Events"' -e 'activate' \
+        -e 'with timeout of 86400 seconds' \
         -e 'display dialog "Could not read the page count automatically." & return & return & "How many pages is this document?" default answer "" with title "Two-Sided Printing"' \
-        -e 'end tell' 2>/dev/null \
+        -e 'end timeout' -e 'end tell' 2>/dev/null \
         | sed 's/.*text returned://; s/,.*//')
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
@@ -291,8 +335,18 @@ wait_for_job() {
   while lpstat -W not-completed -o "$PRINTER" 2>/dev/null | grep -q "^$jobid "; do
     sleep 2
     waited=$((waited + 2))
-    if [ "$waited" -ge 600 ]; then
-      log "timeout waiting for $jobid"
+
+    # A queue that has gone disabled will never drain, so stop waiting on it
+    # rather than sitting here for the full timeout with nothing on screen.
+    if [ $((waited % 10)) -eq 0 ]; then
+      if lpstat -p "$PRINTER" 2>/dev/null | grep -qi "disabled\|stopped"; then
+        log "printer is stopped/disabled while waiting for $jobid"
+        return 1
+      fi
+    fi
+
+    if [ "$waited" -ge 120 ]; then
+      log "job $jobid still queued after ${waited}s"
       return 1
     fi
   done
@@ -314,15 +368,39 @@ wait_for_job() {
 # printer with no duplexer to do the thing it cannot do.
 # ---------------------------------------------------------------------------
 
-opt_is_blocked() {
-  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+# What macOS actually hands over in $2 is not a tidy CUPS options string - it is
+# Apple's internal print-settings dictionary, and many of its values contain
+# spaces:
+#
+#   com.apple.print.DialogDismissedBy=Print Two-Sided
+#   com.apple.print.pageRange=All 11 Pages
+#
+# Split on whitespace and those produce bare fragments - "Two-Sided", "11",
+# "Pages" - which then get passed to lp as `-o Two-Sided`. CUPS accepts the job
+# and the printer then sits on it, which looks exactly like a hung prompt.
+#
+# So this is a whitelist by shape, not a blacklist: a token is only forwarded if
+# it is key=value, the key is a plain option name with no dots, and the value is
+# non-empty. That alone removes every com.apple.print.* key and every stray
+# fragment. The named cases below are real CUPS options we must own ourselves.
+opt_is_allowed() {
+  local key="$1"
+
+  # Plain option name only: letters, digits, underscore, hyphen. Apple's keys
+  # are dotted, so this drops all of them in one go.
+  printf '%s' "$key" | grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$' || return 1
+
+  case "$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" in
+    # page selection and ordering - this tool controls these
     page-ranges|page-set|page-label|outputorder|output-order|copies|collate|\
-    sides|multiple-document-handling|job-uuid|job-id|job-name|\
-    job-originating-host-name|job-originating-user-name|ap_documentname|\
-    document-name) return 0 ;;
-    *duplex*|*tumble*|booklet*) return 0 ;;
+    sides|multiple-document-handling) return 1 ;;
+    # duplex of any flavour: the printer has no duplexer
+    *duplex*|*tumble*|booklet*) return 1 ;;
+    # job bookkeeping and routing, not print settings
+    destinationprinterid|job-*|document-name|ap_documentname|\
+    pserrorhandler-requested|emit-jcl|disallow-binary-quoting) return 1 ;;
   esac
-  return 1
+  return 0
 }
 
 # Split the options string into tokens, honouring the quoting CUPS uses for
@@ -332,8 +410,10 @@ passthrough_opts() {
   [ -z "$raw" ] && return 0
   printf '%s' "$raw" | xargs -n1 2>/dev/null | while IFS= read -r tok; do
     [ -z "$tok" ] && continue
+    case "$tok" in *=*) ;; *) continue ;; esac   # bare fragment - drop it
     key="${tok%%=*}"
-    opt_is_blocked "$key" && continue
+    [ -z "${tok#*=}" ] && continue               # empty value - drop it
+    opt_is_allowed "$key" || continue
     printf '%s\n' "$tok"
   done
 }
@@ -420,19 +500,39 @@ one_pass_pair() {
 
   jobid=$(pass_submit "$pdf" "$title [$p1name]$label" "$p1" "$p1rev") || fail "The printer rejected the job. See the log for details."
   if ! wait_for_job "$jobid"; then
-    [ "$(dialog "The first pass is taking longer than expected - it may be paused or jammed.
+    [ "$(dialog "The first pass has not finished - the printer may be paused, offline or jammed.
 
-Continue anyway?" "Continue" "Stop")" = "Continue" ] || exit 0
+Check it, then click Continue once the fronts have come out.
+
+Printer:  $PRINTER_LABEL" "Continue" "Stop")" = "Continue" ] || { log "stopped at stalled-job prompt"; exit 0; }
   fi
 
-  if [ "$(dialog "Printed $sheets sheet(s) - the $p1name.$label
+  # Re-show the prompt if it comes back empty. An empty answer is not a Cancel -
+  # it means the Apple Event failed or timed out, and abandoning the job there
+  # would leave you holding a half-printed stack with no way to finish it.
+  local prompt answer tries=0
+  prompt="Printed $sheets sheet(s) - the $p1name.$label
 
 $FLIP_HINT$note
 
-Click Continue when the paper is loaded." "Continue" "Cancel")" != "Continue" ]; then
-    log "cancelled at flip prompt"
-    exit 0
-  fi
+Click Continue when the paper is loaded."
+
+  while :; do
+    answer=$(dialog "$prompt" "Continue" "Cancel")
+    case "$answer" in
+      Continue) break ;;
+      Cancel)   log "cancelled at flip prompt"; exit 0 ;;
+      *)
+        tries=$((tries + 1))
+        log "flip prompt returned nothing (attempt $tries) - reshowing"
+        if [ "$tries" -ge 30 ]; then
+          log "giving up after $tries attempts; backs not printed"
+          exit 0
+        fi
+        sleep 2
+        ;;
+    esac
+  done
 
   jobid=$(pass_submit "$pdf" "$title [$p2name]$label" "$p2" "$p2rev") || fail "The printer rejected the job. See the log for details."
   wait_for_job "$jobid"
@@ -449,7 +549,15 @@ run_duplex() {
   case "$nup" in ''|*[!0-9]*) nup=1 ;; esac
   [ "$nup" -lt 1 ] && nup=1
 
-  copies=$(opt_value "${RAW_OPTS:-}" "copies"); [ -z "$copies" ] && copies=1
+  # Apple spells this com.apple.print.PrintSettings.PMCopies..n. rather than
+  # copies=, so fall back to digging it out of the raw dictionary.
+  copies=$(opt_value "${RAW_OPTS:-}" "copies")
+  if [ -z "$copies" ]; then
+    copies=$(printf '%s' "${RAW_OPTS:-}" \
+      | tr ' ' '\n' \
+      | sed -n 's/.*PMCopies[^=]*=\([0-9][0-9]*\).*/\1/p' | head -n1)
+  fi
+  [ -z "$copies" ] && copies=1
   case "$copies" in ''|*[!0-9]*) copies=1 ;; esac
   [ "$copies" -lt 1 ] && copies=1
 
@@ -651,6 +759,100 @@ Run calibration later with:  manual-duplex --calibrate"
   fi
 }
 
+# Terminal-facing health check. Answers the question "I pressed Print and
+# nothing happened" by testing each link in the chain separately.
+doctor() {
+  local svc="${HOME}/Library/PDF Services/Print Two-Sided"
+  local ok="  [ ok ]" bad="  [FAIL]" warn="  [warn]"
+  local t
+
+  echo "manual-duplex doctor"
+  echo "===================="
+  echo
+  echo "Engine"
+  echo "  running from : $0"
+  [ -x "$0" ] && echo "$ok executable" || echo "$bad not executable - chmod +x it"
+
+  echo
+  echo "PDF Service"
+  if [ -f "$svc" ]; then
+    echo "$ok installed at ~/Library/PDF Services/Print Two-Sided"
+    [ -x "$svc" ] && echo "$ok executable" \
+                  || echo "$bad NOT executable - macOS will silently ignore it"
+    # Match the quoted absolute path the wrapper hands to launchctl/nohup, not
+    # the bare ~/.config/manual-duplex strings that also appear in the file.
+    t=$(grep -oE '"/[^"]*/manual-duplex"' "$svc" 2>/dev/null | head -n1 | tr -d '"')
+    if [ -n "$t" ] && [ -x "$t" ]; then
+      echo "$ok points at an installed engine: $t"
+    else
+      echo "$bad points at '$t' which is missing or not executable"
+    fi
+  else
+    echo "$bad not installed - run: bash install.sh"
+  fi
+
+  echo
+  echo "Launcher app  (needed for sandboxed apps like Preview)"
+  local app="${HOME}/Applications/Two-Sided Printing.app"
+  if [ -d "$app" ]; then
+    echo "$ok installed at ~/Applications/Two-Sided Printing.app"
+    [ -x "$app/Contents/MacOS/applet" ] \
+      && echo "$ok bundle executable present" \
+      || echo "$bad bundle looks incomplete - reinstall"
+  else
+    echo "$bad not installed."
+    echo "       Printing from Preview, TextEdit or Pages will silently do"
+    echo "       nothing without it. Reinstall with: bash install.sh"
+  fi
+
+  echo
+  echo "Tools"
+  for t in lp lpstat osascript; do
+    if command -v "$t" >/dev/null 2>&1; then
+      echo "$ok $t -> $(command -v $t)"
+    else
+      echo "$bad $t not found on PATH"
+    fi
+  done
+
+  echo
+  echo "Printer"
+  if [ -z "$PRINTER" ]; then
+    echo "$warn none configured - run: manual-duplex --setup"
+  elif lpstat -p "$PRINTER" >/dev/null 2>&1; then
+    echo "$ok $PRINTER_LABEL ($PRINTER)"
+    echo "       order=$PASS_ORDER  pass1_rev=$PASS1_REVERSE  pass2_rev=$PASS2_REVERSE"
+  else
+    echo "$bad configured queue '$PRINTER' is not available"
+  fi
+
+  echo
+  echo "Handoff test (simulates exactly what the print dialog does)"
+  if [ ! -x "$svc" ]; then
+    echo "$bad skipped - PDF Service not installed"
+  else
+    local tmp before after
+    tmp="${TMPDIR:-/tmp}/manual-duplex-doctor.pdf"
+    make_test_pdf "$tmp"
+    before=$( [ -f "$LOG" ] && wc -l <"$LOG" || echo 0 )
+    echo "       invoking the service with a 4-page test document..."
+    "$svc" "Doctor test" "" "$tmp" >/dev/null 2>&1
+    sleep 4
+    after=$( [ -f "$LOG" ] && wc -l <"$LOG" || echo 0 )
+    if [ "$after" -gt "$before" ]; then
+      echo "$ok the service ran and the engine started. Recent log:"
+      tail -n $(( after - before )) "$LOG" | sed 's/^/       /'
+      echo
+      echo "       If paper came out, everything works and you can print normally."
+    else
+      echo "$bad the service ran but the engine never logged anything."
+      echo "       The handoff is being killed. Reinstall with: bash install.sh"
+    fi
+    rm -f "$tmp"
+  fi
+  echo
+}
+
 status() {
   local first="back sides (evens) first"
   [ "$PASS_ORDER" = "odds-first" ] && first="front sides (odds) first"
@@ -690,6 +892,7 @@ case "${1:-}" in
   --calibrate) [ -z "$PRINTER" ] && pick_printer; calibrate; exit 0 ;;
   --printer)   pick_printer; save_config; status; exit 0 ;;
   --status)    status; exit 0 ;;
+  --doctor)    doctor; exit 0 ;;
   --config)    open -t "$CONFIG" 2>/dev/null || cat "$CONFIG"; exit 0 ;;
   --log)       cat "$LOG"; exit 0 ;;
   --help|-h)   sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -723,10 +926,20 @@ fi
 PASSTHROUGH="$(passthrough_opts "$RAW_OPTS")"
 
 if [ -z "$PDF" ]; then
-  fail "No PDF was handed to Two-Sided Printing.
-
-If you ran this from Terminal, pass a file:
-  manual-duplex.sh yourfile.pdf"
+  # Only complain to a human who typed the command. A launch with no usable
+  # file - a stale launchd job, a re-run of a finished job whose working copy is
+  # already deleted - must stay silent, or it pops a dialog out of nowhere with
+  # no print in progress.
+  # Any tty at all means a person typed this; a launchd or app launch has none.
+  # Testing only stdout would miss `manual-duplex | less`.
+  if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
+    echo "manual-duplex: no PDF given." >&2
+    echo "usage: manual-duplex yourfile.pdf" >&2
+    echo "       manual-duplex --doctor | --status | --setup | --calibrate" >&2
+  else
+    log "no usable PDF in args (${*:-none}) - ignoring silently"
+  fi
+  exit 0
 fi
 
 # Our working copy lives in the jobs folder and is ours to delete on the way out.

@@ -143,7 +143,16 @@ API, which Apple deprecated back in CUPS 2.3 and intends to remove.
 
 ## The helper queues
 
-The installer optionally adds two entries to your printer list:
+**Opt-in, via `bash install.sh --with-queues`.** They are the only part that needs an admin
+password, and the only part whose behaviour isn't verified.
+
+If the password prompt ever appears and the installer carries straight on without waiting,
+that means `sudo` was handed EOF instead of your keystrokes — it happens when the script is
+run without a real terminal (piped, or via an editor's run button). The installer now reads
+the password from `/dev/tty` and skips the queues cleanly if there's no terminal, rather
+than half-creating them.
+
+These add two entries to your printer list:
 
 - `<printer>-Two-Sided-1-Fronts`
 - `<printer>-Two-Sided-2-Backs`
@@ -170,6 +179,7 @@ The PDF Service is the reliable path. The queues are a convenience.
 ## Commands
 
 ```bash
+manual-duplex --doctor      # diagnose "nothing happened when I pressed Print"
 manual-duplex --status      # which printer, calibration state
 manual-duplex --printer     # switch printer
 manual-duplex --setup       # pick printer, calibrate
@@ -177,9 +187,13 @@ manual-duplex --calibrate   # redo calibration only
 manual-duplex --config      # open the settings file
 manual-duplex --log         # what happened on recent jobs
 
-bash install.sh --uninstall # remove everything
-bash install.sh --no-queues # install PDF Service only
+bash install.sh              # install (no password needed)
+bash install.sh --with-queues # also add helper printer queues (needs sudo)
+bash install.sh --uninstall   # remove everything
 ```
+
+The plain install never asks for a password. Only `--with-queues` does, and it asks once
+up front rather than partway through.
 
 ## Icon
 
@@ -225,6 +239,78 @@ If it ever appears again, the log has the detail:
 
 ```bash
 manual-duplex --log
+```
+
+## The sandbox problem (why there's an app bundle)
+
+Since Big Sur, `printtool` — the process that runs items in `~/Library/PDF Services` — is
+itself sandboxed. Scripts placed there can't reliably write files or spawn processes, and
+they fail **silently**: no error, no output, nothing printed.
+
+This bites hardest when printing from a sandboxed app: **Preview, TextEdit, Pages, Mail**.
+Non-sandboxed apps like Chrome are often unaffected, which is what makes it so confusing —
+the same tool works from one app and does nothing from another.
+
+The way around it is to hand off to a real application, which LaunchServices runs in the
+normal user session, outside that sandbox. So the install has two parts:
+
+```
+~/Library/PDF Services/Print Two-Sided   tiny, sandboxed, does one thing: open -a
+~/Applications/Two-Sided Printing.app    compiled from app.applescript, does the work
+```
+
+The PDF Service also drops the CUPS options in a `.mdopts` sidecar next to the spool file.
+The sandbox often refuses that write; when it does, you lose only the quality/colour
+passthrough for that job and the queue defaults apply.
+
+## "No PDF was handed to Two-Sided Printing" appearing at random
+
+A pre-1.0 version of the installer handed jobs off with `launchctl submit`. Those jobs
+persist in your launchd domain and get respawned — and since the working copy of the PDF is
+deleted once a job finishes, each respawn found no file and popped that dialog, with no
+print anywhere in sight.
+
+`install.sh` now clears them on every install and uninstall. To check by hand:
+
+```bash
+launchctl list | grep manualduplex          # should print nothing
+```
+
+The engine also no longer shows that dialog unless you ran it from a terminal. A launch
+with no usable file just logs and exits.
+
+## The Continue prompt disappears on its own
+
+Talking to System Events is an Apple Event, and Apple Events time out after **120 seconds**
+by default. Take longer than two minutes to flip the stack — easy when an odd-page job asks
+you to find a blank sheet — and the event times out and the dialog vanishes, leaving the
+backs unprinted.
+
+Every dialog is now wrapped in `with timeout of 86400 seconds`, and the flip prompt
+re-shows itself if it ever comes back empty. An empty answer is treated as "something went
+wrong", not as Cancel, so a hiccup can't abandon a half-printed stack. Only clicking
+**Cancel** stops the job.
+
+## Nothing happens at all
+
+Run the health check — it tests each link in the chain separately and simulates exactly
+what the print dialog does:
+
+```bash
+~/.local/bin/manual-duplex --doctor
+```
+
+The likely cause is the handoff being killed. `nohup … &` alone is not enough on macOS:
+when the workflow tool returns, the process group can be torn down and the engine dies
+with it — no output, no error, nothing in the log past the wrapper line. The wrapper
+therefore prefers `launchctl submit`, which runs the engine in the user's launchd domain,
+detached from the process group but still inside the GUI session so its dialogs appear.
+
+The wrapper logs **every** invocation. If the log has no `wrapper: invoked` line after you
+press Print, macOS never ran the item — check that it's executable:
+
+```bash
+ls -l ~/Library/PDF\ Services/
 ```
 
 ## Known limits
