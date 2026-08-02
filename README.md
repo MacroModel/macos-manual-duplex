@@ -452,6 +452,16 @@ publishing the repository or handing the folder to anyone.
 
 Every source file carries the standard GPL notice in its header.
 
+## Security
+
+Runs as your user only — no root, nothing persistent, no network access. Print options from
+macOS are filtered before reaching `lp`, and the config directory is mode `700` because the
+config is executed as shell when loaded.
+
+Copies of documents you print pass briefly through `~/.config/manual-duplex/jobs/` and the
+log records document titles. Full detail, including how to report a vulnerability privately,
+is in [SECURITY.md](SECURITY.md).
+
 ## Contributing
 
 It's plain `bash` plus a small AppleScript launcher — no build step, no toolchain.

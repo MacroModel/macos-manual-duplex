@@ -40,6 +40,11 @@ APP_NAME="Two-Sided Printing"
 
 mkdir -p "$CONFIG_DIR" "$JOB_DIR"
 
+# Owner-only. The jobs folder briefly holds copies of whatever you print, and
+# the config is sourced by this script - so neither should be readable or
+# writable by other accounts on the machine.
+chmod 700 "$CONFIG_DIR" "$JOB_DIR" 2>/dev/null || true
+
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${LOG:-/dev/null}"; }
 
 # Clean up our working copy of the spooled PDF however we leave.
@@ -155,9 +160,31 @@ PASS2_REVERSE="yes"          # reverse the second pass
 FLIP_HINT="Flip the stack over, keeping the same edge at the top, and put it back in the input tray."
 PASSTHROUGH_ENABLED=1  # forward the print dialog's settings to both passes
 
-load_config() { [ -f "$CONFIG" ] && . "$CONFIG"; }
+# Loading the config *executes* it - it is shell. That is fine for a file only
+# you can write, so check that before trusting it. A config another account can
+# modify would be a way to run code as you.
+config_is_safe() {
+  local perms g o
+  perms=$(stat -f '%Lp' "$CONFIG" 2>/dev/null || stat -c '%a' "$CONFIG" 2>/dev/null)
+  [ -z "$perms" ] && return 1
+  perms="00$perms"
+  g="${perms: -2:1}"; o="${perms: -1}"
+  case "$g" in 2|3|6|7) return 1 ;; esac      # group-writable
+  case "$o" in 2|3|6|7) return 1 ;; esac      # world-writable
+  return 0
+}
+
+load_config() {
+  [ -f "$CONFIG" ] || return 0
+  if ! config_is_safe; then
+    log "refusing to load $CONFIG - it is writable by other users; using defaults"
+    return 0
+  fi
+  . "$CONFIG"
+}
 
 save_config() {
+  umask 077
   cat >"$CONFIG" <<EOF
 # manual-duplex configuration - written $(date '+%Y-%m-%d %H:%M:%S')
 PRINTER="$PRINTER"
