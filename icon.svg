@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#5B96F9"/>
+      <stop offset="1" stop-color="#2340C8"/>
+    </linearGradient>
+
+    <!-- gloss fades to fully transparent, so it leaves no seam -->
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#FFFFFF" stop-opacity="0.20"/>
+      <stop offset="0.42" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="1"    stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="sheetBack" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#CFDDFB"/>
+      <stop offset="1" stop-color="#9CB6EE"/>
+    </linearGradient>
+
+    <linearGradient id="sheetFront" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E8EFFC"/>
+    </linearGradient>
+
+    <filter id="drop" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#12246B" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+
+  <rect x="64" y="64" width="896" height="896" rx="205" ry="205" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="205" ry="205" fill="url(#gloss)"/>
+
+  <!-- back sheet: the reverse side, tilted away -->
+  <g transform="rotate(-14 512 500)" filter="url(#drop)">
+    <rect x="300" y="248" width="322" height="424" rx="26" ry="26" fill="url(#sheetBack)"/>
+    <rect x="344" y="312" width="176" height="19" rx="9.5" fill="#5C7FCB" opacity="0.50"/>
+    <rect x="344" y="364" width="224" height="19" rx="9.5" fill="#5C7FCB" opacity="0.38"/>
+    <rect x="344" y="416" width="146" height="19" rx="9.5" fill="#5C7FCB" opacity="0.38"/>
+  </g>
+
+  <!-- front sheet: the side facing you -->
+  <g transform="rotate(8 512 500)" filter="url(#drop)">
+    <rect x="404" y="272" width="328" height="430" rx="28" ry="28" fill="url(#sheetFront)"/>
+    <rect x="450" y="340" width="208" height="21" rx="10.5" fill="#2340C8" opacity="0.88"/>
+    <rect x="450" y="396" width="238" height="21" rx="10.5" fill="#5B96F9" opacity="0.52"/>
+    <rect x="450" y="452" width="238" height="21" rx="10.5" fill="#5B96F9" opacity="0.52"/>
+    <rect x="450" y="508" width="156" height="21" rx="10.5" fill="#5B96F9" opacity="0.52"/>
+  </g>
+
+  <!-- flip arrow: U-shaped sweep with a clean triangle at each end -->
+  <g>
+    <path d="M 300 742 A 212 212 0 0 0 724 742"
+          fill="none" stroke="#FFFFFF" stroke-width="44" stroke-linecap="butt"/>
+    <path d="M 300 762 L 244 762 L 300 664 L 356 762 Z" fill="#FFFFFF"/>
+    <path d="M 724 762 L 668 762 L 724 664 L 780 762 Z" fill="#FFFFFF"/>
+  </g>
+</svg>
