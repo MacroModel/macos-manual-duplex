@@ -394,20 +394,56 @@ estimate_timeout() {
   printf '%s' "$budget"
 }
 
+# What the printer is complaining about, in plain words, or nothing if it is
+# happy. CUPS exposes printer-state-reasons on the Alerts line of `lpstat -l -p`.
+#
+# Checking only whether the queue is disabled is not enough: a printer that has
+# run out of paper usually leaves the queue enabled with the job sitting in it,
+# so the job never drains and nothing explains why.
+#
+# Order matters - report the most actionable fault first. "low" states are
+# deliberately absent: they are warnings and printing continues.
+printer_alert() {
+  local raw
+  raw=$(lpstat -l -p "$PRINTER" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  [ -z "$raw" ] && return 0
+  case "$raw" in
+    *media-jam*)                                printf 'there is a paper jam' ;;
+    *media-needed*|*media-empty*)               printf 'it is out of paper' ;;
+    *cover-open*|*door-open*|*interlock-open*)  printf 'a cover or door is open' ;;
+    *marker-supply-empty*|*toner-empty*|*ink-empty*)
+                                                printf 'it is out of ink' ;;
+    *offline-report*|*shutdown*)                printf 'it is offline' ;;
+    *paused*)                                   printf 'the queue is paused' ;;
+  esac
+  return 0
+}
+
+# Set by wait_for_job when it gives up, so the prompt can name the fault.
+WAIT_REASON=""
+
 wait_for_job() {
   # Block until the job leaves the queue, so the flip prompt does not appear
   # while pages are still feeding.
   # <jobid> [budget_seconds]
   local jobid="$1" budget="${2:-1800}" waited=0
+  WAIT_REASON=""
   [ -z "$jobid" ] && { sleep 5; return 0; }
   while lpstat -W not-completed -o "$PRINTER" 2>/dev/null | grep -q "^$jobid "; do
     sleep 2
     waited=$((waited + 2))
 
-    # A queue that has gone disabled will never drain, so stop waiting on it
-    # rather than sitting here for the full timeout with nothing on screen.
+    # Check what the printer is reporting. Out of paper, a jam or an open cover
+    # will never clear on their own, so say so straight away instead of sitting
+    # out the whole budget in silence.
     if [ $((waited % 10)) -eq 0 ]; then
+      WAIT_REASON=$(printer_alert)
+      if [ -n "$WAIT_REASON" ]; then
+        log "printer reports: $WAIT_REASON (waiting for $jobid)"
+        return 1
+      fi
       if lpstat -p "$PRINTER" 2>/dev/null | grep -qi "disabled\|stopped"; then
+        WAIT_REASON="the queue has stopped"
         log "printer is stopped/disabled while waiting for $jobid"
         return 1
       fi
@@ -603,11 +639,18 @@ one_pass_pair() {
 
   jobid=$(pass_submit "$pdf" "$title [$p1name]$label" "$p1" "$p1rev") || fail "The printer rejected the job. See the log for details."
   if ! wait_for_job "$jobid" "$budget"; then
-    [ "$(dialog "The first pass has not finished - the printer may be paused, offline or jammed.
+    local why
+    if [ -n "$WAIT_REASON" ]; then
+      why="$PRINTER_LABEL says $WAIT_REASON."
+    else
+      why="The first pass has not finished yet - $PRINTER_LABEL may just be slow."
+    fi
+    [ "$(dialog "$why
 
-Check it, then click Continue once the fronts have come out.
+Fix it if needed, then click Continue once the first side has finished printing.
 
-Printer:  $PRINTER_LABEL" "Continue" "Stop")" = "Continue" ] || { log "stopped at stalled-job prompt"; exit 0; }
+Nothing has been lost - clicking Continue picks up exactly where it left off." "Continue" "Stop")" = "Continue" ] \
+      || { log "stopped at stalled-job prompt (${WAIT_REASON:-no reason reported})"; exit 0; }
   fi
 
   # Re-show the prompt if it comes back empty. An empty answer is not a Cancel -

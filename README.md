@@ -1,6 +1,6 @@
 # manual-duplex
 
-Two-sided printing on a Mac for printers with no duplexer.
+Two-sided printing on a Mac for printers with no duplexer — like the HP Smart Tank 510.
 
 Instead of remembering to open the print dialog, find "Two-sided (Duplex) Printing", pick
 "Print On Both Sides Manually", and hope you reload the paper the right way round, you pick
@@ -369,8 +369,26 @@ best — multiplied by 1.5 for colour. Clamped to a 5-minute floor and a 6-hour 
 Hitting the budget is not fatal — it asks whether to continue or stop, since the printer may
 just be paused or jammed. The log shows the budget for each pass and progress every 60s.
 
-It also gives up early, regardless of budget, if the queue goes disabled — that will never
-drain no matter how long you wait.
+### Faults it recognises
+
+It doesn't just wait out the clock. Every 10 seconds it reads the printer's state reasons
+from `lpstat -l -p` and stops immediately on anything that won't clear by itself, naming it
+in the prompt — *"HP Smart Tank 510 series says it is out of paper."*
+
+| Reported by the printer | Shown as |
+|---|---|
+| `media-needed`, `media-empty` | it is out of paper |
+| `media-jam` | there is a paper jam |
+| `cover-open`, `door-open`, `interlock-open` | a cover or door is open |
+| `marker-supply-empty`, `toner-empty` | it is out of ink |
+| `offline-report`, `shutdown` | it is offline |
+| queue disabled or paused | the queue has stopped |
+
+`media-low` and `toner-low` are deliberately **not** in that list — they're warnings and
+printing continues, so treating them as faults would interrupt a job that's working.
+
+Running out of paper mid-pass is safe: refill, click **Continue**, and it carries on from
+where it stopped. Nothing is reprinted and no sheet is lost.
 
 ## Nothing happens at all
 
