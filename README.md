@@ -1,6 +1,6 @@
 # manual-duplex
 
-Two-sided printing on a Mac for printers with no duplexer.
+Two-sided printing on a Mac for printers with no duplexer — like the HP Smart Tank 510.
 
 Instead of remembering to open the print dialog, find "Two-sided (Duplex) Printing", pick
 "Print On Both Sides Manually", and hope you reload the paper the right way round, you pick
@@ -27,11 +27,32 @@ It never asks for a password — everything installs into your home folder.
 
 **File → Print → PDF dropdown (bottom-left) → Print Two-Sided**
 
+![The macOS print dialog with the PDF menu open and Print Two-Sided highlighted](docs/print-two-sided-menu.png)
+
 1. The back sides print (evens-first is the default).
 2. A dialog tells you to flip the stack. Flip it, click **Continue**.
 3. The other sides print.
 
-Works from any app that can print — Word, Chrome, Preview, Mail, anything.
+The **PDF** button is in the bottom-left corner of the print dialog — easy to miss, since it
+looks like a file-format button rather than a menu of actions.
+
+### Apps with their own print dialog
+
+Some apps draw their own print UI instead of using the macOS one, and those have no PDF
+dropdown at all. **Chrome** is the common case; its dialog shows Destination / Pages /
+Copies / Color and nothing else:
+
+![Chrome's own print dialog, which has no PDF menu](docs/chrome-print-dialog.png)
+
+Use the escape hatch at the bottom of that dialog:
+
+**Print using system dialog…**  (`⌥⌘P`)
+
+That opens the real macOS print dialog, PDF dropdown and all. The same applies to anything
+else with a custom print sheet — some Electron apps, and Adobe Reader in certain modes.
+
+Preview, Word, Pages, Mail, TextEdit and most native apps use the macOS dialog directly, so
+"Print Two-Sided" is right there in the PDF menu.
 
 ## Why calibration matters
 
@@ -194,6 +215,10 @@ up something that shouldn't have existed.
 | `~/.config/manual-duplex/config` | printer + calibration result |
 | `~/.config/manual-duplex/jobs/` | working copies of spooled PDFs, deleted after each job |
 | `~/.config/manual-duplex/manual-duplex.log` | job history, for when something looks wrong |
+
+Repository layout: `manual-duplex.sh` (engine), `install.sh`, `app.applescript` (launcher
+source), `icon.svg` + `icon.iconset/` (artwork), `docs/` (screenshots),
+`duplex-test-3-pages.pdf` and `duplex-test-4-pages.pdf` (test documents).
 
 ## Commands
 
