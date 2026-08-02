@@ -17,16 +17,15 @@ chmod +x install.sh manual-duplex.sh
 ```
 
 The installer walks you through picking your printer and running a 2-sheet calibration.
-Only the optional helper queues need your password; everything else installs into your
-home folder.
+It never asks for a password — everything installs into your home folder.
 
 ## Use
 
 **File → Print → PDF dropdown (bottom-left) → Print Two-Sided**
 
-1. Fronts print.
-2. A dialog tells you to flip the stack. Flip it, click **Print Backs**.
-3. Backs print.
+1. The back sides print (evens-first is the default).
+2. A dialog tells you to flip the stack. Flip it, click **Continue**.
+3. The other sides print.
 
 Works from any app that can print — Word, Chrome, Preview, Mail, anything.
 
@@ -50,8 +49,21 @@ pass assumed. That's the only thing that genuinely varies between printers.
 
 ## Your print dialog settings carry over
 
-macOS hands a PDF Service the print options you picked, so both passes are printed with
-the same settings rather than falling back to the queue defaults:
+Both passes print with the settings you picked, rather than falling back to queue defaults.
+
+A caveat on how this works. Apple's documentation describes the PDF Service tool's second
+argument as "a string that specifies the CUPS print options". In practice it is Apple's
+internal print-settings dictionary, and many of its values contain spaces:
+
+```
+com.apple.print.DialogDismissedBy=Print Two-Sided
+com.apple.print.pageRange=All 11 Pages
+```
+
+Forwarding that verbatim produces nonsense like `lp -o Two-Sided -o 11 -o Pages`, which
+CUPS accepts and the printer then silently sits on. So options are filtered by shape: a
+token is only passed on if it is `key=value`, the key is a plain option name with no dots,
+and the value is non-empty. What survives:
 
 | Setting | Behaviour |
 |---|---|
@@ -60,7 +72,7 @@ the same settings rather than falling back to the queue defaults:
 | Paper type, paper size, tray | forwarded |
 | Vendor-specific HP options | forwarded |
 | Layout / pages-per-sheet (N-up) | forwarded, and the split accounts for it |
-| Copies | handled specially — see below |
+| Copies | forwarded, single pass — see below |
 | Page range | already applied to the spooled PDF |
 | Two-sided setting | ignored, obviously |
 
@@ -72,12 +84,12 @@ If some vendor option ever makes `lp` reject a job, set `PASSTHROUGH_ENABLED=0` 
 
 ### Copies
 
-Asking for 3 copies runs the front/back cycle three times, prompting between each, rather
-than sending `copies=3` in one job. That is deliberate: a single multi-copy job interleaves
-the copies in the output stack, and reversing then applies *across* copies instead of
-within one — which is exactly how page 2 ends up on the back of page 7.
+All copies print in a single pass, so there is only ever **one flip** no matter how many
+you ask for. That is safe because the copies are identical: reversing the whole job
+produces the same sequence as reversing within each copy.
 
-Three prompts instead of one, in exchange for never re-printing a ruined stack.
+Collation is set explicitly, because it has to match across both passes or the sheets stop
+lining up.
 
 ### Pages per sheet
 
@@ -101,25 +113,31 @@ Switch to `PASS_ORDER="odds-first"` in the config for the other arrangement (fro
 
 ## Odd page counts
 
-An odd-page document has one more sheet than it has even pages, so with evens-first the
-first pass comes up a sheet short. A 7-page document has 4 sheets but only 3 even pages.
+An odd-page document has one more sheet than it has even pages, so the first pass comes up
+a sheet short. A 7-page document is 4 sheets but only 3 even pages.
 
-The tool detects this and the flip prompt tells you to **add one blank sheet on top of the
-stack**. Pass 2 prints in reverse, so the highest page comes out first and lands on that
-blank sheet:
+**A blank page is appended to the document, so the printer feeds and ejects that sheet
+itself.** No manual step. A 7-page job becomes an 8-page one and prints:
 
 ```
-pass 1 sends       6, 4, 2          (3 sheets)
-feed after flip    blank, 6, 4, 2   (you added one on top)
-pass 2 sends       7, 5, 3, 1
-result             7/blank, 5/6, 3/4, 1/2
+pass 1   8, 6, 4, 2      page 8 is blank - the sheet comes out empty
+   ...flip...
+pass 2   7, 5, 3, 1      page 7 lands on the back of that blank sheet
 ```
 
-With `odds-first` there's no extra sheet — the last sheet simply keeps a blank back.
+The padding is done with PDFKit through `osascript -l JavaScript`, which is part of macOS —
+still no dependencies. Blank pages are sized to match the last real page, and the padded
+copy is deleted when the job finishes.
+
+Under N-up the padding fills whole sides: 6 pages at 2-up is 3 sides, so 2 blank pages are
+added to make 4.
+
+**If padding fails** the tool falls back to the old behaviour — the flip prompt asks you to
+add a blank sheet on top of the stack by hand — rather than printing something wrong.
 
 ## How it works
 
-No PDF splitting and no dependencies. macOS `lp` already accepts page selection and output
+No dependencies. macOS `lp` already accepts page selection and output
 ordering, so the whole thing is two calls:
 
 ```bash
@@ -129,49 +147,46 @@ lp -o page-ranges=1,3,5,7,9  -o outputorder=reverse \
    -o cupsPrintQuality=5 -o ColorModel=Gray doc.pdf     # pass 2: fronts
 ```
 
-A PDF Service tool is invoked with three parameters — document title, a string of the CUPS
-print options for the job, and the path to the spooled PDF. Parsing the second one is what
-makes the settings passthrough above possible.
+Everything else is page counting (PDFKit then CoreGraphics via `osascript -l JavaScript`,
+falling back to a raw scan of the page tree, falling back to asking you), waiting for the
+first pass to actually finish before prompting, and remembering your settings.
 
-Everything else is page counting (PDFKit via `osascript -l JavaScript`, falling back to
-Spotlight metadata, falling back to asking you), waiting for the first pass to actually
-finish before prompting, and remembering your settings.
+It hooks in as a **PDF Service** rather than a printer driver, deliberately: the CUPS
+driver API was deprecated in CUPS 2.3 and is slated for removal.
 
-It installs as a **PDF Service** — an executable in `~/Library/PDF Services` that macOS
-lists in every print dialog's PDF menu. This deliberately avoids the CUPS printer-driver
-API, which Apple deprecated back in CUPS 2.3 and intends to remove.
+## One printer, not three
 
-## The helper queues
+Both passes go to your single installed printer — the same queue you already print to. All
+that changes between them is the `-o page-ranges` argument:
 
-**Opt-in, via `bash install.sh --with-queues`.** They are the only part that needs an admin
-password, and the only part whose behaviour isn't verified.
+```
+lp -d HP_Smart_Tank_510_series__95C868_ -o page-ranges=2,4,6,8,10 -o outputorder=reverse ...
+lp -d HP_Smart_Tank_510_series__95C868_ -o page-ranges=1,3,5,7,9  -o outputorder=reverse ...
+```
 
-If the password prompt ever appears and the installer carries straight on without waiting,
-that means `sudo` was handed EOF instead of your keystrokes — it happens when the script is
-run without a real terminal (piped, or via an editor's run button). The installer now reads
-the password from `/dev/tty` and skips the queues cleanly if there's no terminal, rather
-than half-creating them.
+Earlier versions could also add two extra printers to your list, `...-Two-Sided-1-Fronts`
+and `-2-Backs`. That's been removed. It was the wrong shape for the problem: a print queue
+has no way to pause and ask you to flip the paper, so it could never do the one thing this
+tool exists to do — and it relied on the CUPS `page-set` option that driverless queues
+often ignore.
 
-These add two entries to your printer list:
+If an earlier install left those queues behind, `install.sh` will point them out. Remove
+them with:
 
-- `<printer>-Two-Sided-1-Fronts`
-- `<printer>-Two-Sided-2-Backs`
+```bash
+sudo lpadmin -x <queue-name>
+```
 
-These give you a printer-list entry rather than a PDF-menu entry, but they rely on the
-CUPS `page-set` option, which some driverless queues silently ignore.
-
-**Verify once:** print a 4-page document to `...Two-Sided-1-Fronts`. If you get pages 1
-and 3, they work. If you get all 4, your queue ignores `page-set` — remove them and use
-the PDF dropdown, which computes explicit page ranges and always works.
-
-The PDF Service is the reliable path. The queues are a convenience.
+That is the only command in this project that needs a password, and it's only for cleaning
+up something that shouldn't have existed.
 
 ## Files it touches
 
 | Path | What |
 |---|---|
 | `~/.local/bin/manual-duplex` | the engine |
-| `~/Library/PDF Services/Print Two-Sided` | the print-dialog menu item |
+| `~/Library/PDF Services/Print Two-Sided` | the print-dialog menu item (sandboxed; hands off) |
+| `~/Applications/Two-Sided Printing.app` | the launcher that does the work |
 | `~/.config/manual-duplex/config` | printer + calibration result |
 | `~/.config/manual-duplex/jobs/` | working copies of spooled PDFs, deleted after each job |
 | `~/.config/manual-duplex/manual-duplex.log` | job history, for when something looks wrong |
@@ -187,13 +202,11 @@ manual-duplex --calibrate   # redo calibration only
 manual-duplex --config      # open the settings file
 manual-duplex --log         # what happened on recent jobs
 
-bash install.sh              # install (no password needed)
-bash install.sh --with-queues # also add helper printer queues (needs sudo)
-bash install.sh --uninstall   # remove everything
+bash install.sh             # install
+bash install.sh --uninstall # remove everything
 ```
 
-The plain install never asks for a password. Only `--with-queues` does, and it asks once
-up front rather than partway through.
+The install never asks for a password. Everything lives in your home folder.
 
 ## Icon
 
@@ -279,17 +292,54 @@ launchctl list | grep manualduplex          # should print nothing
 The engine also no longer shows that dialog unless you ran it from a terminal. A launch
 with no usable file just logs and exits.
 
-## The Continue prompt disappears on its own
+## The prompt never appears, or disappears on its own
 
-Talking to System Events is an Apple Event, and Apple Events time out after **120 seconds**
-by default. Take longer than two minutes to flip the stack — easy when an odd-page job asks
-you to find a blank sheet — and the event times out and the dialog vanishes, leaving the
-backs unprinted.
+Two separate causes, both fixed.
 
-Every dialog is now wrapped in `with timeout of 86400 seconds`, and the flip prompt
-re-shows itself if it ever comes back empty. An empty answer is treated as "something went
-wrong", not as Cancel, so a hiccup can't abandon a half-printed stack. Only clicking
-**Cancel** stops the job.
+**Automation permission.** Dialogs used to be shown via `tell application "System Events"`,
+which is an Apple Event to another app — and macOS gates those behind the Automation
+privacy permission. A shell script launched in the background has no application identity,
+so the system denies it outright and does not even offer a prompt to approve:
+
+```
+execution error: Not authorized to send Apple events to System Events. (-1743)
+```
+
+`osascript` showing its own dialog needs no permission, so that is what it does now, with
+`tell me to activate` to bring it forward.
+
+**Apple Event timeouts.** While System Events was still involved, the 120-second default
+Apple Event timeout also made the prompt vanish mid-flip. Gone with the same change.
+
+The flip prompt additionally re-shows itself if it ever comes back empty. An empty answer
+is treated as "something went wrong", not as Cancel, so a hiccup cannot abandon a
+half-printed stack. Only clicking **Cancel** stops the job.
+
+## How long it waits before complaining
+
+Each pass gets a time budget worked out from the job itself, rather than a fixed cap. A
+fixed number is wrong at both ends — it nags on a two-page draft and expires mid-print on a
+long one:
+
+```
+sides x copies x seconds-per-side x 2 (headroom)  +  3 min base
+```
+
+Seconds-per-side comes from the quality setting — 8s at draft, 20s normal, up to 60s at
+best — multiplied by 1.5 for colour. Clamped to a 5-minute floor and a 6-hour ceiling.
+
+| Job | Budget |
+|---|---|
+| 2 sides, draft, greyscale | 5 min |
+| 5 sides, best, colour | 18 min |
+| 15 sides (3 copies), best, colour | 48 min |
+| 40 sides, best, colour | 2 hrs |
+
+Hitting the budget is not fatal — it asks whether to continue or stop, since the printer may
+just be paused or jammed. The log shows the budget for each pass and progress every 60s.
+
+It also gives up early, regardless of budget, if the queue goes disabled — that will never
+drain no matter how long you wait.
 
 ## Nothing happens at all
 

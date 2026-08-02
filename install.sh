@@ -2,12 +2,10 @@
 #
 # Installer for manual-duplex.
 #
-#   ./install.sh              install PDF Service + helper queues
-#   ./install.sh --no-queues  install the PDF Service only
+#   ./install.sh              install
 #   ./install.sh --uninstall  remove everything
 #
-# Nothing here needs sudo except creating the helper printer queues, and you
-# will be prompted for that separately (and can decline).
+# Nothing here needs sudo. Everything installs into your home folder.
 
 set -euo pipefail
 
@@ -33,19 +31,17 @@ if [ "$(id -u)" -eq 0 ]; then
 
 Run it as yourself:   bash install.sh
 
-It will ask for your password on its own, and only for the optional
-printer-queue step."
+Nothing here needs admin rights."
 fi
 
 # Reject stray arguments rather than silently ignoring them.
 case "${1:-}" in
-  ""|--no-queues|--with-queues|--uninstall) ;;
+  ""|--uninstall) ;;
   *) die "Unknown option: $1
 
 Usage:
-  bash install.sh               install the PDF Service (no password needed)
-  bash install.sh --with-queues also add the helper printer queues (needs sudo)
-  bash install.sh --uninstall   remove everything" ;;
+  bash install.sh             install
+  bash install.sh --uninstall remove everything" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -192,91 +188,22 @@ EOF
 chmod 755 "$SERVICE"
 green "Installed service -> PDF dropdown item \"Print Two-Sided\""
 
-# --- 3. helper queues --------------------------------------------------------
+# --- 3. leftover helper queues ----------------------------------------------
+# Earlier versions could add two extra printers ("...-Two-Sided-1-Fronts" and
+# "-2-Backs") as a way to drive this from the printer list. That was a mistake:
+# a print queue has no way to pause and ask you to flip the paper, and it relied
+# on the CUPS page-set option that driverless queues often ignore. Both passes
+# have always gone to your one real printer. The feature is gone; if a previous
+# install left the queues behind, point them out - removing a queue needs admin
+# rights, so it is not something to do silently mid-install.
 
-# The helper queues are opt-in. They are the one part of this that needs an
-# admin password, and the one part whose behaviour is not verified: they rely on
-# the CUPS page-set option, which driverless queues often ignore. The PDF Service
-# is the path that actually works, and it needs no password at all.
-if [ "${1:-}" = "--with-queues" ]; then
+STALE=$(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -- '-Two-Sided-' || true)
+if [ -n "$STALE" ]; then
   echo
-  echo "Adding two entries to your printer list so you can drive this"
-  echo "straight from the Printer menu instead of the PDF dropdown."
-  echo
-
-  # Ask for credentials once, up front, on the real terminal. sudo reads its
-  # prompt from the tty; if the installer is run without one - piped, or from an
-  # editor's run button - the prompt appears and is immediately fed EOF, so it
-  # looks like it "didn't wait for the password" and carried on.
-  SKIP_QUEUES=0
-  if [ ! -e /dev/tty ]; then
-    warn "No terminal available for the password prompt - skipping helper queues."
-    warn "Run 'bash install.sh --with-queues' directly in Terminal to add them."
-    SKIP_QUEUES=1
-  elif ! sudo -v </dev/tty; then
-    warn "Could not get admin rights - skipping helper queues."
-    warn "The PDF Service is installed and works without them."
-    SKIP_QUEUES=1
-  fi
-
-  # No mapfile here: macOS ships bash 3.2, which predates it.
-  QUEUES=""
-  if [ "$SKIP_QUEUES" -eq 0 ]; then
-    while IFS= read -r q; do
-      [ -n "$q" ] && QUEUES="${QUEUES}${q}"$'\n'
-    done < <(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -v -- '-Two-Sided-' || true)
-  fi
-
-  if [ -z "$QUEUES" ]; then
-    [ "$SKIP_QUEUES" -eq 0 ] && warn "No printers found - skipping helper queues."
-  else
-    QCOUNT=$(printf '%s' "$QUEUES" | grep -c . || true)
-    if [ "$QCOUNT" -eq 1 ]; then
-      BASE=$(printf '%s' "$QUEUES" | head -n1)
-    else
-      echo "Which printer?"
-      # Read from the terminal, not stdin: stdin may be a pipe or already
-      # consumed, in which case select would EOF instantly and pick nothing.
-      # shellcheck disable=SC2086
-      select BASE in $QUEUES "skip"; do
-        [ -n "${BASE:-}" ] && break
-      done </dev/tty
-      [ "$BASE" = "skip" ] && BASE=""
-    fi
-
-    if [ -n "${BASE:-}" ]; then
-      URI=$(lpstat -v "$BASE" 2>/dev/null | sed -n 's/.*: *//p')
-      if [ -z "$URI" ]; then
-        warn "Could not read the device URI for $BASE - skipping helper queues."
-      else
-        echo
-        echo "Creating two queues pointing at $URI"
-        echo "(you will be asked for your password)"
-
-        make_queue() {
-          local name="$1" desc="$2"; shift 2
-          sudo lpadmin -p "$name" -v "$URI" -E -m everywhere \
-               -D "$desc" -o printer-is-shared=false "$@" 2>/dev/null \
-            || sudo lpadmin -p "$name" -v "$URI" -E \
-               -D "$desc" -o printer-is-shared=false "$@"
-        }
-
-        if make_queue "${BASE}-Two-Sided-1-Fronts" "Two-Sided step 1: fronts" \
-             -o page-set-default=odd \
-           && make_queue "${BASE}-Two-Sided-2-Backs" "Two-Sided step 2: backs" \
-             -o page-set-default=even -o outputorder-default=reverse; then
-          green "Created helper queues."
-          echo
-          warn "Verify these once: print a 4-page document to '...Two-Sided-1-Fronts'."
-          warn "If all 4 pages come out instead of just 1 and 3, your driver ignores"
-          warn "page-set. Remove them with ./install.sh --uninstall and use the PDF"
-          warn "dropdown instead, which computes explicit page ranges and always works."
-        else
-          warn "Could not create helper queues. The PDF Service works regardless."
-        fi
-      fi
-    fi
-  fi
+  warn "Found leftover helper queues from an earlier version:"
+  printf '%s\n' "$STALE" | sed 's/^/        /'
+  warn "They are no longer used. Remove them with:"
+  printf '%s\n' "$STALE" | sed 's/^/        sudo lpadmin -x /'
 fi
 
 # --- 4. first-run setup ------------------------------------------------------
@@ -292,10 +219,6 @@ cat <<'EOF'
 
 How to use it
 -------------
-  Helper printer queues were not installed - they need an admin password and
-  rely on a CUPS option many printers ignore. Add them with:
-      bash install.sh --with-queues
-
   In any app:  File > Print > PDF dropdown (bottom-left) > Print Two-Sided
   Follow the prompt, flip the stack when asked, done.
 

@@ -5,8 +5,10 @@
 # Invoked as a macOS PDF Service (from the PDF dropdown in any print dialog),
 # or directly:   manual-duplex.sh [--calibrate|--setup|--config] [file.pdf]
 #
-# No dependencies beyond what ships with macOS. No PDF splitting: page
-# selection is handed to CUPS via -o page-ranges.
+# No dependencies beyond what ships with macOS. Page selection is handed to CUPS
+# via -o page-ranges rather than by splitting the PDF; the only PDF edit is
+# appending a blank page to odd-sided documents so the printer feeds the extra
+# sheet itself.
 
 set -uo pipefail
 
@@ -27,7 +29,12 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${LOG:-/dev/nul
 
 # Clean up our working copy of the spooled PDF however we leave.
 CLEANUP_FILE=""
-on_exit() { [ -n "$CLEANUP_FILE" ] && rm -f "$CLEANUP_FILE"; return 0; }
+PAD_FILE=""
+on_exit() {
+  [ -n "$CLEANUP_FILE" ] && rm -f "$CLEANUP_FILE"
+  [ -n "$PAD_FILE" ] && rm -f "$PAD_FILE"
+  return 0
+}
 trap on_exit EXIT
 
 # Always leave with status 0.
@@ -50,8 +57,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Dialog helpers (osascript). All dialogs are attached to System Events so they
-# come to the front even though we are a background script.
+# Dialog helpers. osascript shows its own dialogs - deliberately not via System
+# Events, which would need Automation permission this process cannot get.
 # ---------------------------------------------------------------------------
 
 dialog() {
@@ -63,19 +70,19 @@ dialog() {
   else
     script="display dialog \"$text\" buttons {\"$b1\"} default button \"$b1\" with title \"$APP_NAME\" $ICON_CLAUSE"
   fi
-  # Two things are load-bearing here:
+  # Do NOT route this through `tell application "System Events"`.
   #
-  # `activate` - System Events is a faceless background app, so without it the
-  # dialog can open behind the document window you just printed from.
+  # That is an Apple Event to another app, which macOS gates behind the
+  # Automation privacy permission. A shell script launched in the background has
+  # no application identity, so the system denies it outright - and does not
+  # even show a prompt to approve:
   #
-  # `with timeout` - talking to System Events is an Apple Event, and those time
-  # out after 120 seconds by default. Without this the prompt silently vanishes
-  # two minutes in, which is easy to hit while you are hunting for a blank sheet.
+  #   execution error: Not authorized to send Apple events to System Events. (-1743)
+  #
+  # osascript displaying its own dialog needs no permission at all. `tell me to
+  # activate` brings it to the front, replacing what System Events was for.
   local raw
-  raw=$(osascript -e 'tell application "System Events"' -e 'activate' \
-                  -e 'with timeout of 86400 seconds' \
-                  -e "$script" \
-                  -e 'end timeout' -e 'end tell' 2>&1)
+  raw=$(osascript -e 'tell me to activate' -e "$script" 2>&1)
 
   # Never swallow osascript's error text. A dialog that fails to appear at all
   # is almost always an AppleScript compile error in the message, and without
@@ -93,10 +100,9 @@ dialog() {
 alert() {
   local text="$1"
   text="${text//\\/\\\\}"; text="${text//\"/\\\"}"
-  osascript -e 'tell application "System Events"' -e 'activate' \
-            -e 'with timeout of 86400 seconds' \
+  osascript -e 'tell me to activate' \
             -e "display dialog \"$text\" buttons {\"OK\"} default button \"OK\" with title \"$APP_NAME\" $ICON_CLAUSE" \
-            -e 'end timeout' -e 'end tell' >/dev/null 2>&1
+            >/dev/null 2>&1
 }
 
 choose_from() {
@@ -105,10 +111,9 @@ choose_from() {
   local list="" i
   for i in "$@"; do list+="\"${i//\"/\\\"}\", "; done
   list="${list%, }"
-  osascript -e 'tell application "System Events"' -e 'activate' \
-    -e 'with timeout of 86400 seconds' \
+  osascript -e 'tell me to activate' \
     -e "choose from list {$list} with prompt \"${prompt//\"/\\\"}\" with title \"$APP_NAME\"" \
-    -e 'end timeout' -e 'end tell' 2>/dev/null
+    2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -273,23 +278,16 @@ JXA
   [ -n "$n" ] && [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
   log "page_count: JXA returned nothing for $f"
 
-  # 2. Spotlight metadata. Usually unavailable here - our jobs folder lives
-  # under a dot-directory, which Spotlight does not index - but it is free.
-  n=$(mdls -raw -name kMDItemNumberOfPages "$f" 2>/dev/null)
-  case "$n" in ''|*[!0-9]*) n="" ;; esac
-  [ -n "$n" ] && [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
-
-  # 3. Read the page tree out of the PDF itself. Works on uncompressed page
+  # 2. Read the page tree out of the PDF itself. Works on uncompressed page
   # trees; returns nothing when the document uses object streams.
   n=$(LC_ALL=C grep -a -o '/Type[[:space:]]*/Page[^s]' "$f" 2>/dev/null | wc -l | tr -d ' ')
   case "$n" in ''|*[!0-9]*) n="" ;; esac
   [ -n "$n" ] && [ "$n" -gt 0 ] && { log "page_count: fell back to raw scan ($n)"; printf '%s' "$n"; return 0; }
 
-  # 3. Ask the user rather than guessing wrong and wasting a stack of paper.
-  n=$(osascript -e 'tell application "System Events"' -e 'activate' \
-        -e 'with timeout of 86400 seconds' \
+  # 3. Ask, rather than guess wrong and waste a stack of paper.
+  n=$(osascript -e 'tell me to activate' \
         -e 'display dialog "Could not read the page count automatically." & return & return & "How many pages is this document?" default answer "" with title "Two-Sided Printing"' \
-        -e 'end timeout' -e 'end tell' 2>/dev/null \
+        2>/dev/null \
         | sed 's/.*text returned://; s/,.*//')
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
@@ -306,6 +304,13 @@ submit() {
   local out jobid o
   local -a lpargs
   lpargs=(-d "$PRINTER" -t "$title" -o "page-ranges=$ranges")
+
+  # Copies are handled here rather than by repeating the whole flow, so there is
+  # only ever one flip. Collation is set explicitly because it must match across
+  # both passes - see the note in run_duplex.
+  if [ "${COPIES_N:-1}" -gt 1 ]; then
+    lpargs+=(-o "copies=${COPIES_N}" -o "collate=${COLLATE_V:-true}")
+  fi
 
   # Forward the settings the user chose in the print dialog.
   if [ "${PASSTHROUGH_ENABLED:-1}" = "1" ]; then
@@ -327,10 +332,58 @@ $out"
   printf '%s' "$jobid"
 }
 
+# How many pages a range string covers: "1-2,5-6" -> 4, "2,4,6" -> 3
+count_in_ranges() {
+  local r="$1" tot=0 part a b oldifs="$IFS"
+  IFS=','
+  for part in $r; do
+    case "$part" in
+      *-*) a="${part%%-*}"; b="${part##*-}"; tot=$(( tot + b - a + 1 )) ;;
+      *)   tot=$(( tot + 1 )) ;;
+    esac
+  done
+  IFS="$oldifs"
+  printf '%s' "$tot"
+}
+
+# Work out how long this pass could reasonably take.
+#
+# A fixed cap is wrong at both ends: it nags on a short draft job and expires
+# mid-print on a long one. An inkjet at best quality can spend the better part of
+# a minute on a single side, so scale with the actual sheet count and the quality
+# that was asked for, then double it for headroom.
+estimate_timeout() {
+  # estimate_timeout <sheets_in_this_pass> -> seconds
+  local sheets="$1" per=20 base=180 q colour budget
+
+  q=$(printf '%s' "${PASSTHROUGH:-}" \
+      | sed -n 's/.*cupsPrintQuality=\([^ ]*\).*/\1/p' | head -n1)
+  case "$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')" in
+    5|high|best|photo) per=60 ;;
+    4)                 per=35 ;;
+    3|normal)          per=20 ;;
+    2|draft|fast)      per=8  ;;
+  esac
+
+  # Colour costs more passes of the head than greyscale.
+  colour=$(printf '%s' "${PASSTHROUGH:-}" \
+           | sed -n 's/.*ColorModel=\([^ ]*\).*/\1/p' | head -n1)
+  case "$(printf '%s' "$colour" | tr '[:upper:]' '[:lower:]')" in
+    gray|grayscale|black|mono) ;;
+    ?*) per=$(( per * 3 / 2 )) ;;
+  esac
+
+  budget=$(( base + sheets * per * 2 ))
+  [ "$budget" -lt 300 ]   && budget=300      # never nag inside 5 minutes
+  [ "$budget" -gt 21600 ] && budget=21600    # but do not wait past 6 hours
+  printf '%s' "$budget"
+}
+
 wait_for_job() {
   # Block until the job leaves the queue, so the flip prompt does not appear
   # while pages are still feeding.
-  local jobid="$1" waited=0
+  # <jobid> [budget_seconds]
+  local jobid="$1" budget="${2:-1800}" waited=0
   [ -z "$jobid" ] && { sleep 5; return 0; }
   while lpstat -W not-completed -o "$PRINTER" 2>/dev/null | grep -q "^$jobid "; do
     sleep 2
@@ -345,8 +398,11 @@ wait_for_job() {
       fi
     fi
 
-    if [ "$waited" -ge 120 ]; then
-      log "job $jobid still queued after ${waited}s"
+    # Log progress so a slow job is visibly progressing rather than looking hung.
+    [ $((waited % 60)) -eq 0 ] && log "still waiting on $jobid (${waited}s of ${budget}s)"
+
+    if [ "$waited" -ge "$budget" ]; then
+      log "job $jobid still queued after ${waited}s (budget ${budget}s) - asking the user"
       return 1
     fi
   done
@@ -467,13 +523,41 @@ side_ranges() {
   printf '%s' "${out%,}"
 }
 
-sheet_count() {
-  # sheet_count <pages> <number-up>  -> physical sheets needed
-  local pages="$1" k="$2" sides
-  [ "$k" -lt 1 ] && k=1
-  sides=$(( (pages + k - 1) / k ))
-  printf '%s' "$(( (sides + 1) / 2 ))"
+# Append blank pages to a copy of the document.
+#
+# An odd-sided document needs one more sheet than the first pass prints, and lp
+# cannot feed a sheet for a page that does not exist. Rather than asking you to
+# add paper by hand, append a real blank page: the printer then feeds and ejects
+# that sheet itself, and the second pass prints on its back.
+#
+# Uses PDFKit through JavaScript for Automation - part of macOS, nothing to
+# install. Blank pages are sized to match the last real page.
+pad_pdf() {
+  # pad_pdf <src> <dst> <count>  -> prints OK, or ERR ...
+  osascript -l JavaScript - "$1" "$2" "$3" 2>&1 <<'JXA'
+function run(argv) {
+  ObjC.import('Quartz');
+  var n = parseInt(argv[2], 10);
+  if (!(n > 0)) { return 'ERR bad count'; }
+
+  var doc = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(argv[0]));
+  if (!doc || doc.isNil()) { return 'ERR cannot open source'; }
+  var count = doc.pageCount;
+  if (count < 1) { return 'ERR source has no pages'; }
+
+  var bounds = doc.pageAtIndex(count - 1).boundsForBox($.kPDFDisplayBoxMediaBox);
+  for (var i = 0; i < n; i++) {
+    var blank = $.PDFPage.alloc.init;
+    if (!blank || blank.isNil()) { return 'ERR cannot create blank page'; }
+    blank.setBoundsForBox(bounds, $.kPDFDisplayBoxMediaBox);
+    doc.insertPageAtIndex(blank, doc.pageCount);
+  }
+  if (!doc.writeToFile(argv[1])) { return 'ERR write failed'; }
+  return 'OK';
 }
+JXA
+}
+
 
 # ---------------------------------------------------------------------------
 # Main duplex run
@@ -498,8 +582,12 @@ one_pass_pair() {
         sheets="$9" note="${10}" label="${11}"
   local jobid
 
+  local budget
+  budget=$(estimate_timeout "$(( $(count_in_ranges "$p1") * ${COPIES_N:-1} ))")
+  log "pass 1: $(count_in_ranges "$p1") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
+
   jobid=$(pass_submit "$pdf" "$title [$p1name]$label" "$p1" "$p1rev") || fail "The printer rejected the job. See the log for details."
-  if ! wait_for_job "$jobid"; then
+  if ! wait_for_job "$jobid" "$budget"; then
     [ "$(dialog "The first pass has not finished - the printer may be paused, offline or jammed.
 
 Check it, then click Continue once the fronts have come out.
@@ -534,8 +622,11 @@ Click Continue when the paper is loaded."
     esac
   done
 
+  budget=$(estimate_timeout "$(( $(count_in_ranges "$p2") * ${COPIES_N:-1} ))")
+  log "pass 2: $(count_in_ranges "$p2") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
+
   jobid=$(pass_submit "$pdf" "$title [$p2name]$label" "$p2" "$p2rev") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid"
+  wait_for_job "$jobid" "$budget"
 }
 
 run_duplex() {
@@ -574,9 +665,25 @@ Print it normally?" "Print" "Cancel")" = "Print" ]; then
     exit 0
   fi
 
+  # Odd number of sides? Pad the document so the printer supplies the extra
+  # sheet itself, instead of asking you to slot one in at the flip.
+  if [ $((sides % 2)) -eq 1 ]; then
+    local want_pages=$(( (sides + 1) * nup )) padded result
+    padded="${JOB_DIR}/padded-$$-$(date +%s).pdf"
+    result=$(pad_pdf "$pdf" "$padded" $(( want_pages - pages )))
+    if [ "$result" = "OK" ] && [ -s "$padded" ]; then
+      log "padded with $(( want_pages - pages )) blank page(s) - printer will eject the extra sheet"
+      PAD_FILE="$padded"
+      pdf="$padded"
+      pages="$want_pages"
+      sides=$(( (pages + nup - 1) / nup ))
+    else
+      log "could not pad ($result) - will ask for a blank sheet instead"
+    fi
+  fi
+
   fronts=$(side_ranges "$pages" "$nup" odd)
   backs=$(side_ranges "$pages" "$nup" even)
-  sheets=$(sheet_count "$pages" "$nup")
 
   # Which pass runs first, and in which direction.
   local p1 p1rev p1name p2 p2rev p2name
@@ -588,40 +695,42 @@ Print it normally?" "Print" "Cancel")" = "Print" ]; then
     p2="$backs";  p2rev="$PASS2_REVERSE"; p2name="back sides"
   fi
 
+  # How many sheets each pass covers, per copy.
+  local evens_n=$(( sides / 2 )) odds_n=$(( (sides + 1) / 2 ))
+  local p1_n p2_n blanks
+  if [ "$PASS_ORDER" = "evens-first" ]; then p1_n=$evens_n; p2_n=$odds_n
+  else                                       p1_n=$odds_n;  p2_n=$evens_n
+  fi
+  sheets=$(( p1_n * copies ))
+  blanks=$(( (p2_n - p1_n) * copies ))
+  [ "$blanks" -lt 0 ] && blanks=0
+
+  # Copies go in a single pass, so there is only ever one flip. That is safe
+  # because the copies are identical: reversing the whole job produces the same
+  # sequence as reversing within each copy.
+  #
+  # Collation must match across both passes, and for an odd-page document with
+  # more than one copy it must be OFF. Collated output groups each copy
+  # together, which bunches all the blank sheets at the top instead of one per
+  # copy; uncollated groups by sheet, so the blanks land where they belong.
+  COPIES_N="$copies"
+  COLLATE_V="true"
+  [ "$blanks" -gt 0 ] && [ "$copies" -gt 1 ] && COLLATE_V="false"
+
   note=""
-  if [ $((sides % 2)) -eq 1 ]; then
-    if [ "$PASS_ORDER" = "evens-first" ]; then
-      # Printing backs first leaves the run one sheet short: the final sheet has
-      # no even side, so nothing feeds it in pass 1. Pass 2 prints in reverse,
-      # so the highest page comes out first and needs that sheet fed first.
-      sheets=$(( sides / 2 ))
-      note="
+  if [ "$blanks" -gt 0 ]; then
+    note="
 
-IMPORTANT: this document has an odd number of sides, so pass 2 needs one more sheet than pass 1 printed.
-
-Add ONE BLANK SHEET on top of the stack before continuing. Page $pages prints on it."
-    else
-      note="
-
-Note: the last sheet's back stays blank. Leave it in the stack - it is handled."
-    fi
+Could not add a blank page automatically, so this pass needs $blanks more sheet(s) than the last one printed. Add $blanks blank sheet(s) on TOP of the stack before continuing."
   fi
 
-  # Multiple copies are run as separate two-sided passes rather than by handing
-  # copies=N to lp. A single N-copy job would interleave the copies in the
-  # output stack, and outputorder=reverse would then reverse across copies
-  # instead of within one - which is precisely how you end up with page 2 on
-  # the back of page 7.
-  n=1
-  while [ "$n" -le "$copies" ]; do
-    label=""
-    [ "$copies" -gt 1 ] && label="  (copy $n of $copies)"
-    one_pass_pair "$pdf" "$title" \
-                  "$p1" "$p1rev" "$p1name" \
-                  "$p2" "$p2rev" "$p2name" \
-                  "$sheets" "$note" "$label"
-    n=$(( n + 1 ))
-  done
+  local label=""
+  [ "$copies" -gt 1 ] && label="  ($copies copies)"
+
+  one_pass_pair "$pdf" "$title" \
+                "$p1" "$p1rev" "$p1name" \
+                "$p2" "$p2rev" "$p2name" \
+                "$sheets" "$note" "$label"
 
   log "job '$title' complete"
   exit 0
@@ -701,7 +810,7 @@ Load at least 2 sheets, then click Start." "Start" "Cancel")" = "Start" ] || exi
   fi
 
   jobid=$(pass_submit "$tmp" "Duplex calibration [$p1n]" "$p1" "$PASS1_REVERSE") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid"
+  wait_for_job "$jobid" "$(estimate_timeout 2)"
 
   [ "$(dialog "You should now have 2 sheets, printed on one side.
 
@@ -710,7 +819,7 @@ $FLIP_HINT
 Click Continue when loaded." "Continue" "Cancel")" = "Continue" ] || exit 0
 
   jobid=$(pass_submit "$tmp" "Duplex calibration [$p2n]" "$p2" "yes") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid"
+  wait_for_job "$jobid" "$(estimate_timeout 2)"
 
   # One question tells us whether the sheets fed back in the order the second
   # pass assumed. That is the only thing that varies between printers.
