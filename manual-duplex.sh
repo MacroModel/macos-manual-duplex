@@ -111,6 +111,13 @@ dialog() {
     *"button returned"*)
       printf '%s' "$raw" | sed 's/.*button returned://; s/,.*//'
       ;;
+    *"-128"*|*"User canceled"*|*"User cancelled"*)
+      # AppleScript treats a button literally named "Cancel" as the dialog's
+      # cancel button: pressing it raises error -128 instead of returning a
+      # button name. Without this, callers see an empty answer, read it as a
+      # glitch, and re-show the dialog - so Cancel becomes impossible to press.
+      printf 'Cancel'
+      ;;
     *)
       log "dialog failed: ${raw:-<no output>}"
       ;;
@@ -680,6 +687,24 @@ Nothing has been lost - clicking Continue picks up exactly where it left off." "
       || { log "stopped at stalled-job prompt (${WAIT_REASON:-no reason reported})"; exit 0; }
   fi
 
+  # The wait above only notices a fault while the job is still queued. A network
+  # printer will often accept the entire job, let CUPS mark it complete, and only
+  # then discover it has no paper - so check again now, before asking you to
+  # flip a stack that was never fully printed.
+  local fault
+  fault=$(printer_alert)
+  if [ -n "$fault" ]; then
+    log "printer reports after pass 1: $fault"
+    if [ "$(dialog "$PRINTER_LABEL says $fault.
+
+The first side may not have finished printing.
+
+Fix it and wait for printing to stop, then click Continue." "Continue" "Cancel")" != "Continue" ]; then
+      log "cancelled at printer-fault prompt ($fault)"
+      exit 0
+    fi
+  fi
+
   # Re-show the prompt if it comes back empty. An empty answer is not a Cancel -
   # it means the Apple Event failed or timed out, and abandoning the job there
   # would leave you holding a half-printed stack with no way to finish it.
@@ -694,7 +719,13 @@ Click Continue when the paper is loaded."
     answer=$(dialog "$prompt" "Continue" "Cancel")
     case "$answer" in
       Continue) break ;;
-      Cancel)   log "cancelled at flip prompt"; exit 0 ;;
+      Cancel)
+        # The first pass is already on paper. Record exactly how to finish it,
+        # so cancelling costs a decision rather than a stack of sheets.
+        log "cancelled at flip prompt - to print the other side later, flip the stack and run:"
+        log "    lp -d $PRINTER -o page-ranges=$p2 $([ "$p2rev" = yes ] && echo '-o outputorder=reverse ')'<the same document>'"
+        exit 0
+        ;;
       *)
         tries=$((tries + 1))
         log "flip prompt returned nothing (attempt $tries) - reshowing"
