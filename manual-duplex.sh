@@ -124,6 +124,23 @@ dialog() {
   esac
 }
 
+# A dialog that closes itself after <seconds> if untouched. Echoes the button
+# pressed, or nothing if it timed out - which lets a message stay on screen while
+# a condition is polled, without the user having to dismiss it.
+dialog_timed() {
+  # dialog_timed <text> <button> <seconds>
+  local text="$1" b="$2" secs="$3" script raw
+  text="${text//\\/\\\\}"; text="${text//\"/\\\"}"
+  script="display dialog \"$text\" buttons {\"$b\"} with title \"$APP_NAME\" $ICON_CLAUSE giving up after $secs"
+  raw=$(osascript -e 'tell me to activate' -e "$script" 2>&1)
+  case "$raw" in
+    *"gave up:true"*)    : ;;                 # nobody touched it - stay silent
+    *"button returned"*) printf '%s' "$raw" | sed 's/.*button returned://; s/,.*//' ;;
+    *"-128"*|*"User canceled"*|*"User cancelled"*) printf '%s' "$b" ;;
+    *) log "timed dialog failed: ${raw:-<no output>}" ;;
+  esac
+}
+
 alert() {
   local text="$1"
   text="${text//\\/\\\\}"; text="${text//\"/\\\"}"
@@ -166,6 +183,7 @@ PASS1_REVERSE="yes"          # reverse the first pass
 PASS2_REVERSE="yes"          # reverse the second pass
 FLIP_HINT="Flip the stack over, keeping the same edge at the top, and put it back in the input tray."
 PASSTHROUGH_ENABLED=1  # forward the print dialog's settings to both passes
+SHOW_QUEUE=1           # open the printer's queue window so the Dock shows progress
 
 # Loading the config *executes* it - it is shell. That is fine for a file only
 # you can write, so check that before trusting it. A config another account can
@@ -207,6 +225,10 @@ FLIP_HINT="${FLIP_HINT//\"/\\\"}"
 # passes. Set to 0 if a vendor-specific option ever makes lp reject the job;
 # the queue defaults are then used instead.
 PASSTHROUGH_ENABLED=${PASSTHROUGH_ENABLED:-1}
+
+# Open the printer's queue window while printing, so macOS shows its normal Dock
+# progress. Set to 0 if you would rather nothing appeared.
+SHOW_QUEUE=${SHOW_QUEUE:-1}
 EOF
 }
 
@@ -657,6 +679,103 @@ pass_submit() {
   fi
 }
 
+# Block until this side is genuinely finished: the job has left the queue AND
+# the printer reports no fault.
+#
+# The flip prompt must never appear while something is wrong - being told to
+# flip a stack that is half printed is worse than being told nothing. So while a
+# fault is present this shows a self-dismissing message instead, re-checking
+# every few seconds. Fix the printer and it carries on by itself; there is
+# nothing to click.
+#
+# Returns 0 when ready, 1 if the user chose to stop.
+# Show the native print progress.
+#
+# Jobs submitted with `lp` are ordinary CUPS jobs and do appear in the normal
+# queue - but nothing launches the queue window, so there is no Dock icon and no
+# progress, unlike printing from an app.
+#
+# macOS keeps a per-printer proxy app in ~/Library/Printers, named after the
+# printer. Opening it gives exactly the native progress UI. `-g` keeps it in the
+# background so it does not steal focus from whatever you are doing.
+open_print_queue() {
+  [ "${SHOW_QUEUE:-1}" = "1" ] || return 0
+
+  local app base want_a want_b
+  want_a=$(printf '%s' "${PRINTER_LABEL:-}" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+  want_b=$(printf '%s' "${PRINTER:-}"       | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+
+  for app in "$HOME/Library/Printers/"*.app; do
+    [ -d "$app" ] || continue
+    base=$(basename "$app" .app | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+    if [ -n "$base" ] && { [ "$base" = "$want_a" ] || [ "$base" = "$want_b" ]; }; then
+      open -g "$app" 2>/dev/null && { log "opened print queue: $(basename "$app")"; return 0; }
+    fi
+  done
+
+  # Names do not always match exactly - fall back to a containment test.
+  for app in "$HOME/Library/Printers/"*.app; do
+    [ -d "$app" ] || continue
+    base=$(basename "$app" .app | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')
+    case "$want_b" in
+      *"$base"*) [ ${#base} -ge 6 ] && open -g "$app" 2>/dev/null \
+                   && { log "opened print queue (fuzzy): $(basename "$app")"; return 0; } ;;
+    esac
+  done
+
+  log "no printer proxy app found in ~/Library/Printers - no Dock progress"
+  return 0
+}
+
+wait_until_ready() {
+  local jobid="$1" budget="$2"
+  local waited=0 fault ans queued last=""
+
+  while :; do
+    queued=no
+    if [ -n "$jobid" ]; then
+      lpstat -W not-completed -o "$PRINTER" 2>/dev/null | grep -q "^$jobid " && queued=yes
+    fi
+    fault=$(printer_alert)
+
+    # Clean: nothing queued, nothing wrong.
+    if [ "$queued" = "no" ] && [ -z "$fault" ]; then
+      sleep 3                      # let the last sheet finish ejecting
+      return 0
+    fi
+
+    if [ -n "$fault" ]; then
+      [ "$fault" != "$last" ] && log "waiting - printer reports: $fault"
+      last="$fault"
+      ans=$(dialog_timed "$PRINTER_LABEL says $fault.
+
+Printing continues by itself once this is fixed - you do not need to click anything.
+
+This message will close when the printer is ready." "Stop" 8)
+      if [ "$ans" = "Stop" ]; then
+        log "user stopped at fault prompt ($fault)"
+        return 1
+      fi
+      waited=0                     # time spent faulted is not the print taking long
+      continue
+    fi
+
+    sleep 2
+    waited=$((waited + 2))
+    [ $((waited % 60)) -eq 0 ] && log "still waiting on $jobid (${waited}s of ${budget}s)"
+
+    if [ "$waited" -ge "$budget" ]; then
+      ans=$(dialog "The first side is taking longer than expected on $PRINTER_LABEL.
+
+No fault is being reported, so it may just be slow.
+
+Keep waiting?" "Keep Waiting" "Stop")
+      [ "$ans" = "Stop" ] && { log "user stopped at slow-job prompt"; return 1; }
+      waited=0
+    fi
+  done
+}
+
 one_pass_pair() {
   # Print one complete two-sided copy.
   # <pdf> <title> <p1_ranges> <p1_rev> <p1_name> <p2_ranges> <p2_rev> <p2_name>
@@ -672,37 +791,10 @@ one_pass_pair() {
   log "pass 1: $(count_in_ranges "$p1") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
 
   jobid=$(pass_submit "$pdf" "$title [$p1name]$label" "$p1" "$p1rev") || fail "The printer rejected the job. See the log for details."
-  if ! wait_for_job "$jobid" "$budget"; then
-    local why
-    if [ -n "$WAIT_REASON" ]; then
-      why="$PRINTER_LABEL says $WAIT_REASON."
-    else
-      why="The first pass has not finished yet - $PRINTER_LABEL may just be slow."
-    fi
-    [ "$(dialog "$why
-
-Fix it if needed, then click Continue once the first side has finished printing.
-
-Nothing has been lost - clicking Continue picks up exactly where it left off." "Continue" "Stop")" = "Continue" ] \
-      || { log "stopped at stalled-job prompt (${WAIT_REASON:-no reason reported})"; exit 0; }
-  fi
-
-  # The wait above only notices a fault while the job is still queued. A network
-  # printer will often accept the entire job, let CUPS mark it complete, and only
-  # then discover it has no paper - so check again now, before asking you to
-  # flip a stack that was never fully printed.
-  local fault
-  fault=$(printer_alert)
-  if [ -n "$fault" ]; then
-    log "printer reports after pass 1: $fault"
-    if [ "$(dialog "$PRINTER_LABEL says $fault.
-
-The first side may not have finished printing.
-
-Fix it and wait for printing to stop, then click Continue." "Continue" "Cancel")" != "Continue" ]; then
-      log "cancelled at printer-fault prompt ($fault)"
-      exit 0
-    fi
+  open_print_queue
+  if ! wait_until_ready "$jobid" "$budget"; then
+    log "stopped while waiting for the first side"
+    exit 0
   fi
 
   # Re-show the prompt if it comes back empty. An empty answer is not a Cancel -
@@ -742,7 +834,8 @@ Click Continue when the paper is loaded."
   log "pass 2: $(count_in_ranges "$p2") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
 
   jobid=$(pass_submit "$pdf" "$title [$p2name]$label" "$p2" "$p2rev") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid" "$budget"
+  open_print_queue
+  wait_until_ready "$jobid" "$budget" || log "stopped while waiting for the second side"
 }
 
 run_duplex() {
@@ -1029,6 +1122,14 @@ doctor() {
     echo "       Printing from Preview, TextEdit or Pages will silently do"
     echo "       nothing without it. Reinstall with: bash install.sh"
   fi
+
+  echo
+  echo "Native print progress"
+  local found=0 a
+  for a in "$HOME/Library/Printers/"*.app; do
+    [ -d "$a" ] && { echo "$ok proxy app: $(basename "$a")"; found=1; }
+  done
+  [ "$found" -eq 0 ] && echo "$warn none in ~/Library/Printers - no Dock progress will show"
 
   echo
   echo "Tools"

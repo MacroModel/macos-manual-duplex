@@ -369,6 +369,19 @@ best — multiplied by 1.5 for colour. Clamped to a 5-minute floor and a 6-hour 
 Hitting the budget is not fatal — it asks whether to continue or stop, since the printer may
 just be paused or jammed. The log shows the budget for each pass and progress every 60s.
 
+### The flip prompt only appears after a clean finish
+
+The rule is simple: **you are only asked to flip the stack once the side has actually
+finished printing and the printer reports no fault.** Being told to flip a half-printed
+stack is worse than being told nothing.
+
+If something is wrong, a different message appears instead — naming the fault — and it
+**waits**. You do not have to click anything: fix the printer and it carries on by itself,
+the message closing when the printer is ready. There is a **Stop** button if you want out.
+
+Time spent stalled doesn't count against the print budget, so a long paper refill can't
+cause a spurious "taking longer than expected".
+
 ### Faults it recognises
 
 It doesn't just wait out the clock. Every 10 seconds it reads the printer's state reasons
@@ -387,8 +400,28 @@ in the prompt — *"HP Smart Tank 510 series says it is out of paper."*
 `media-low` and `toner-low` are deliberately **not** in that list — they're warnings and
 printing continues, so treating them as faults would interrupt a job that's working.
 
+The check runs in two places, which matters more than it sounds. Polling only *while the
+job is queued* misses the common network-printer case: the printer accepts the whole job,
+CUPS marks it complete, and only then reports it has no paper. So the printer is checked
+again after each pass finishes, before you are asked to flip anything — otherwise you would
+be told to flip a stack that never finished printing.
+
 Running out of paper mid-pass is safe: refill, click **Continue**, and it carries on from
 where it stopped. Nothing is reprinted and no sheet is lost.
+
+## Native print progress
+
+Jobs submitted with `lp` are ordinary CUPS jobs and show up in the normal print queue — but
+nothing launches the queue window, so by default there's no Dock icon and no progress, which
+is why a two-sided print used to look different from a normal one.
+
+macOS keeps a per-printer proxy app in `~/Library/Printers/`, named after the printer.
+Opening it produces exactly the native progress UI, so each pass now opens it in the
+background (`open -g`, so it doesn't steal focus).
+
+Turn it off with `SHOW_QUEUE=0` in `~/.config/manual-duplex/config`. If no proxy app exists
+for your printer, it logs that and carries on — `manual-duplex --doctor` reports which apps
+it can see.
 
 ## Nothing happens at all
 
