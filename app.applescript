@@ -62,7 +62,6 @@ on handlePDF(spoolPath)
 		do shell script "/bin/rm -f " & quoted form of optsPath
 	end try
 
-	do shell script "/bin/rm -f " & quoted form of spoolPath
 	runEngine(docTitle, cupsOpts, copyPath)
 end handlePDF
 

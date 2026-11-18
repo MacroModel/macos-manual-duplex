@@ -7,8 +7,8 @@ Instead of remembering to open the print dialog, find "Two-sided (Duplex) Printi
 one menu item and follow a prompt.
 
 **Free software**, licensed under the [GNU General Public License v3.0 or later](#licence).
-No dependencies beyond what ships with macOS, nothing phones home, and every line of it is
-plain shell you can read.
+The installer builds a Swift helper with the macOS Command Line Tools. At runtime the
+workflow uses system frameworks and the existing print queue.
 
 ![icon](icon.png)
 
@@ -20,8 +20,8 @@ chmod +x install.sh manual-duplex.sh
 ./install.sh
 ```
 
-The installer walks you through picking your printer and running a 2-sheet calibration.
-It never asks for a password — everything installs into your home folder.
+The installer opens printer and paper settings. It installs in your home folder.
+Use `bash install.sh --update-engine` to upgrade an existing installation.
 
 ## Use
 
@@ -29,9 +29,9 @@ It never asks for a password — everything installs into your home folder.
 
 ![The macOS print dialog with the PDF menu open and Print Two-Sided highlighted](docs/print-two-sided-menu.png)
 
-1. The back sides print (evens-first is the default).
-2. A dialog tells you to flip the stack. Flip it, click **Continue**.
-3. The other sides print.
+1. Select long-edge or short-edge binding and the paper faces. Click **打印** to print the backs, or **保存配置** to remember the selections and stay in the window.
+2. Reload the whole stack as the prompt describes, including any blank sheets. Click **继续**.
+3. The fronts print onto the same sheets. The two passes contain the same number of sides.
 
 The **PDF** button is in the bottom-left corner of the print dialog — easy to miss, since it
 looks like a file-format button rather than a menu of actions.
@@ -54,29 +54,31 @@ else with a custom print sheet — some Electron apps, and Adobe Reader in certa
 Preview, Word, Pages, Mail, TextEdit and most native apps use the macOS dialog directly, so
 "Print Two-Sided" is right there in the PDF menu.
 
-## Why calibration matters
+## Paper settings
 
-The one thing that ruins manual duplex is paper *stacking order*. Some printers eject
-face-up, some face-down, and that decides which order the sheets feed back in after you
-flip them. Get it wrong and page 2 lands on the back of page 7.
+**翻转方式** selects the edge used to turn the finished sheet. For portrait paper,
+long-edge is book-style and short-edge is calendar-style.
 
-Calibration prints two sheets, asks you one question about what you're holding, and saves
-the answer. You do it once. Re-run any time:
+**出纸时已印面** is the printed face in the output tray. **放回时已印面** is
+the printed face when inserted for the second pass. Choose according to how your
+printer feeds paper. When the two faces match, transfer the stack together in the
+same orientation. When they differ, turn the entire stack over left to right and
+keep the original machine-facing edge pointed into the printer.
+
+**出纸时页首（竖版）** describes which way the first-pass header lies in the output
+tray. For the HP Laser MFP 115nw profile, both printed faces point down and the
+header points toward the machine. Change the saved defaults with:
 
 ```bash
-~/.local/bin/manual-duplex --calibrate
+~/.local/bin/manual-duplex --paper-settings
 ```
 
-### What it's deciding
+## Print dialog settings
 
-Calibration sets `PASS2_REVERSE` — whether the sheets fed back in the order the second
-pass assumed. That's the only thing that genuinely varies between printers.
+The engine forwards available CUPS settings to both passes. Missing settings
+use the printer's queue defaults.
 
-## Your print dialog settings carry over
-
-Both passes print with the settings you picked, rather than falling back to queue defaults.
-
-A caveat on how this works. Apple's documentation describes the PDF Service tool's second
+Apple's documentation describes the PDF Service tool's second
 argument as "a string that specifies the CUPS print options". In practice it is Apple's
 internal print-settings dictionary, and many of its values contain spaces:
 
@@ -96,10 +98,10 @@ and the value is non-empty. What survives:
 | Colour vs greyscale | forwarded |
 | Paper type, paper size, tray | forwarded |
 | Vendor-specific HP options | forwarded |
-| Layout / pages-per-sheet (N-up) | forwarded, and the split accounts for it |
-| Copies | forwarded, single pass — see below |
+| Layout / pages-per-sheet (N-up) | built into the generated PDF sides when supplied as CUPS options |
+| Copies | built into both PDF passes |
 | Page range | already applied to the spooled PDF |
-| Two-sided setting | ignored, obviously |
+| Two-sided setting | controlled by Print Two-Sided |
 
 Anything that selects pages or ordering is deliberately stripped before forwarding, since
 that is the one thing this tool has to control itself.
@@ -107,87 +109,32 @@ that is the one thing this tool has to control itself.
 If some vendor option ever makes `lp` reject a job, set `PASSTHROUGH_ENABLED=0` in
 `~/.config/manual-duplex/config` to fall back to queue defaults.
 
-### Copies
+### Copies and pages per sheet
 
-All copies print in a single pass, so there is only ever **one flip** no matter how many
-you ask for. That is safe because the copies are identical: reversing the whole job
-produces the same sequence as reversing within each copy.
-
-Collation is set explicitly, because it has to match across both passes or the sheets stop
-lining up.
-
-### Pages per sheet
-
-The split works in *sheet sides*, not document pages. An 8-page document at 2-up is 4
-sides on 2 sheets, so it prints fronts `1-2,5-6` and backs `3-4,7-8`.
+Each generated pass includes every requested copy in matching stack order. The
+planner groups document pages into sides when Pages per Sheet is supplied. For
+an odd number of sides, it writes one blank side per copy before either pass is
+sent, verifies the generated page counts, and prints one PDF page per sheet.
 
 ## Print order
 
-Default is **evens-first**, both passes reversed. A 10-page document prints:
+With the HP Laser MFP 115nw settings, a 7-page document follows this four-sheet sequence.
 
 ```
-pass 1   10, 8, 6, 4, 2      the back sides
-   ...flip the stack...
-pass 2    9, 7, 5, 3, 1      the front sides
+pass 1   blank, 6, 4, 2
+         move the whole stack from the output tray to the input tray
+pass 2   1, 3, 5, 7
 ```
 
-Each sheet pairs correctly and the finished stack lands in reading order.
+The planner maps both orders from the selected output and reload faces. For
+short-edge binding in the HP profile, the planner rotates the second pass by
+180 degrees. Quartz writes printable pages as PDF content in the derived order.
+The shell engine sends each prepared file as a separate single-sided CUPS job.
 
-Switch to `PASS_ORDER="odds-first"` in the config for the other arrangement (fronts first,
-`1,3,5,7` then `2,4,6`).
+## Printer queue
 
-## Odd page counts
-
-An odd-page document has one more sheet than it has even pages, so the first pass comes up
-a sheet short. A 7-page document is 4 sheets but only 3 even pages.
-
-**A blank page is appended to the document, so the printer feeds and ejects that sheet
-itself.** No manual step. A 7-page job becomes an 8-page one and prints:
-
-```
-pass 1   8, 6, 4, 2      page 8 is blank - the sheet comes out empty
-   ...flip...
-pass 2   7, 5, 3, 1      page 7 lands on the back of that blank sheet
-```
-
-The padding is done with PDFKit through `osascript -l JavaScript`, which is part of macOS —
-still no dependencies. Blank pages are sized to match the last real page, and the padded
-copy is deleted when the job finishes.
-
-Under N-up the padding fills whole sides: 6 pages at 2-up is 3 sides, so 2 blank pages are
-added to make 4.
-
-**If padding fails** the tool falls back to the old behaviour — the flip prompt asks you to
-add a blank sheet on top of the stack by hand — rather than printing something wrong.
-
-## How it works
-
-No dependencies. macOS `lp` already accepts page selection and output
-ordering, so the whole thing is two calls:
-
-```bash
-lp -o page-ranges=2,4,6,8,10 -o outputorder=reverse \
-   -o cupsPrintQuality=5 -o ColorModel=Gray doc.pdf     # pass 1: backs
-lp -o page-ranges=1,3,5,7,9  -o outputorder=reverse \
-   -o cupsPrintQuality=5 -o ColorModel=Gray doc.pdf     # pass 2: fronts
-```
-
-Everything else is page counting (PDFKit then CoreGraphics via `osascript -l JavaScript`,
-falling back to a raw scan of the page tree, falling back to asking you), waiting for the
-first pass to actually finish before prompting, and remembering your settings.
-
-It hooks in as a **PDF Service** rather than a printer driver, deliberately: the CUPS
-driver API was deprecated in CUPS 2.3 and is slated for removal.
-
-## One printer, not three
-
-Both passes go to your single installed printer — the same queue you already print to. All
-that changes between them is the `-o page-ranges` argument:
-
-```
-lp -d HP_Smart_Tank_510_series__95C868_ -o page-ranges=2,4,6,8,10 -o outputorder=reverse ...
-lp -d HP_Smart_Tank_510_series__95C868_ -o page-ranges=1,3,5,7,9  -o outputorder=reverse ...
-```
+Both passes go to the configured printer. The job label ends in `[双面 1/2]`
+or `[双面 2/2]` so the two passes can be identified in the queue.
 
 Earlier versions could also add two extra printers to your list, `...-Two-Sided-1-Fronts`
 and `-2-Backs`. That's been removed. It was the wrong shape for the problem: a print queue
@@ -210,24 +157,25 @@ up something that shouldn't have existed.
 | Path | What |
 |---|---|
 | `~/.local/bin/manual-duplex` | the engine |
+| `~/.local/bin/manual-duplex-plan` | paper settings window and PDF planner |
 | `~/Library/PDF Services/Print Two-Sided` | the print-dialog menu item (sandboxed; hands off) |
 | `~/Applications/Two-Sided Printing.app` | the launcher that does the work |
-| `~/.config/manual-duplex/config` | printer + calibration result |
+| `~/.config/manual-duplex/config` | printer and paper settings |
 | `~/.config/manual-duplex/jobs/` | working copies of spooled PDFs, deleted after each job |
 | `~/.config/manual-duplex/manual-duplex.log` | job history, for when something looks wrong |
 
-Repository layout: `manual-duplex.sh` (engine), `install.sh`, `app.applescript` (launcher
-source), `icon.svg` + `icon.iconset/` (artwork), `docs/` (screenshots),
-`duplex-test-3-pages.pdf` and `duplex-test-4-pages.pdf` (test documents).
+Repository layout: `manual-duplex.sh` (engine), `DuplexPlan.swift` (paper settings and PDF planner),
+`install.sh`, `app.applescript` (launcher source), `icon.svg` and `icon.iconset/` (artwork),
+and `docs/` (screenshots).
 
 ## Commands
 
 ```bash
 manual-duplex --doctor      # diagnose "nothing happened when I pressed Print"
-manual-duplex --status      # which printer, calibration state
+manual-duplex --status      # printer and paper settings
 manual-duplex --printer     # switch printer
-manual-duplex --setup       # pick printer, calibrate
-manual-duplex --calibrate   # redo calibration only
+manual-duplex --setup       # choose printer and configure paper
+manual-duplex --paper-settings  # change binding and paper orientation
 manual-duplex --config      # open the settings file
 manual-duplex --log         # what happened on recent jobs
 manual-duplex --help        # usage
@@ -425,8 +373,7 @@ it can see.
 
 ## Nothing happens at all
 
-Run the health check — it tests each link in the chain separately and simulates exactly
-what the print dialog does:
+The health check lists the installed engine, planner, launcher, service, and queue.
 
 ```bash
 ~/.local/bin/manual-duplex --doctor
@@ -497,16 +444,15 @@ is in [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-It's plain `bash` plus a small AppleScript launcher — no build step, no toolchain.
+The installer builds `DuplexPlan.swift` and compiles the AppleScript launcher.
 
 ```bash
-bash -n manual-duplex.sh install.sh   # syntax check
-bash install.sh                       # install your working copy
-~/.local/bin/manual-duplex --doctor   # verify the install end to end
+bash -n manual-duplex.sh
+bash -n install.sh
+bash install.sh --update-engine      # update an existing installation
+~/.local/bin/manual-duplex --doctor  # inspect the installation
 ```
 
-Two test documents are included: `duplex-test-4-pages.pdf` for the straightforward case and
-`duplex-test-3-pages.pdf` for the odd-page path, which is where the interesting bugs live.
 The engine writes a detailed log to `~/.config/manual-duplex/manual-duplex.log` — please
 include the relevant part when reporting a problem, since almost every issue in this tool's
 history was diagnosed from it.
@@ -516,8 +462,7 @@ associative arrays, and mind that expanding an empty array under `set -u` is an 
 
 ## Known limits
 
-- A jam mid-stack leaves you half-printed. The log records the exact page ranges, so you
-  can re-send the backs by hand with `lp -o page-ranges=...`.
-- Page count for encrypted or damaged PDFs may fail; it asks you rather than guessing.
+- Inspect the stack and the print queue after a paper jam. The log includes the two job IDs.
+- An unreadable or print-protected PDF stops during preparation.
 - Not sandboxed, so it can't ship on the Mac App Store. Fine for personal use; if you ever
   distribute it, it needs notarizing.

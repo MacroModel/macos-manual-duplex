@@ -18,12 +18,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 # Invoked as a macOS PDF Service (from the PDF dropdown in any print dialog),
-# or directly:   manual-duplex.sh [--calibrate|--setup|--config] [file.pdf]
-#
-# No dependencies beyond what ships with macOS. Page selection is handed to CUPS
-# via -o page-ranges rather than by splitting the PDF; the only PDF edit is
-# appending a blank page to odd-sided documents so the printer feeds the extra
-# sheet itself.
+# or directly:   manual-duplex [--paper-settings|--setup|--config] [file.pdf]
+# The native helper prepares two equal-length PDFs before the first submission.
 
 set -uo pipefail
 
@@ -37,6 +33,7 @@ CONFIG="${CONFIG_DIR}/config"
 LOG="${CONFIG_DIR}/manual-duplex.log"
 ICON="${CONFIG_DIR}/manual-duplex.icns"
 APP_NAME="Two-Sided Printing"
+PLAN_HELPER="${HOME}/.local/bin/manual-duplex-plan"
 
 mkdir -p "$CONFIG_DIR" "$JOB_DIR"
 
@@ -49,10 +46,13 @@ log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"${LOG:-/dev/nul
 
 # Clean up our working copy of the spooled PDF however we leave.
 CLEANUP_FILE=""
-PAD_FILE=""
+PASS_DIR=""
 on_exit() {
   [ -n "$CLEANUP_FILE" ] && rm -f "$CLEANUP_FILE"
-  [ -n "$PAD_FILE" ] && rm -f "$PAD_FILE"
+  if [ -n "$PASS_DIR" ]; then
+    rm -f "$PASS_DIR/first.pdf" "$PASS_DIR/second.pdf"
+    rmdir "$PASS_DIR"
+  fi
   return 0
 }
 trap on_exit EXIT
@@ -167,21 +167,10 @@ choose_from() {
 PRINTER=""             # CUPS queue name, e.g. HP_Smart_Tank_510_series__95C868_
 PRINTER_LABEL=""       # what the user calls it, e.g. HP Smart Tank 510 series
 
-# Which side gets printed first, and in which direction each pass runs.
-#
-#   evens-first : backs (2,4,6...) then fronts (1,3,5...)
-#   odds-first  : fronts then backs
-#
-# Both passes reversed - the evens-first default - means a 10-page document
-# prints 10,8,6,4,2 and then 9,7,5,3,1. That pairs each sheet correctly and
-# leaves the finished stack in reading order on a printer that ejects face-up.
-#
-# The two REVERSE knobs exist because stacking behaviour varies by printer. If
-# the pairing comes out wrong, flipping PASS2_REVERSE is the first thing to try.
-PASS_ORDER="evens-first"     # evens-first | odds-first
-PASS1_REVERSE="yes"          # reverse the first pass
-PASS2_REVERSE="yes"          # reverse the second pass
-FLIP_HINT="Flip the stack over, keeping the same edge at the top, and put it back in the input tray."
+BIND_EDGE="long"       # long | short, the physical edge used to turn the finished sheet
+OUTPUT_FACE=""        # down | up, orientation of the printed face in the output tray
+RELOAD_FACE=""        # down | up, orientation of the printed face in the input tray
+OUTPUT_HEAD="inside"  # inside | outside, where the top edge lands in the output tray
 PASSTHROUGH_ENABLED=1  # forward the print dialog's settings to both passes
 SHOW_QUEUE=1           # open the printer's queue window so the Dock shows progress
 
@@ -209,27 +198,54 @@ load_config() {
 }
 
 save_config() {
-  umask 077
-  cat >"$CONFIG" <<EOF
-# manual-duplex configuration - written $(date '+%Y-%m-%d %H:%M:%S')
-PRINTER="$PRINTER"
-PRINTER_LABEL="${PRINTER_LABEL//\"/\\\"}"
+  local pending
+  pending=$(mktemp "$CONFIG_DIR/config.XXXXXX") || return 1
+  if {
+    printf '# manual-duplex configuration\n'
+    printf 'PRINTER=%q\nPRINTER_LABEL=%q\n' "$PRINTER" "$PRINTER_LABEL"
+    printf 'BIND_EDGE=%q\nOUTPUT_FACE=%q\nRELOAD_FACE=%q\nOUTPUT_HEAD=%q\n' \
+      "$BIND_EDGE" "$OUTPUT_FACE" "$RELOAD_FACE" "$OUTPUT_HEAD"
+    printf 'PASSTHROUGH_ENABLED=%q\nSHOW_QUEUE=%q\n' "$PASSTHROUGH_ENABLED" "$SHOW_QUEUE"
+  } >"$pending" && mv -f "$pending" "$CONFIG"; then
+    return 0
+  fi
+  rm -f "$pending"
+  return 1
+}
 
-# evens-first | odds-first, and the direction of each pass.
-PASS_ORDER="$PASS_ORDER"
-PASS1_REVERSE="$PASS1_REVERSE"
-PASS2_REVERSE="$PASS2_REVERSE"
-FLIP_HINT="${FLIP_HINT//\"/\\\"}"
+load_paper_defaults() {
+  # The existing HP profile used reversed backs and forward fronts. Derive the
+  # new face settings from both directions for other previously configured printers.
+  if [ -z "$OUTPUT_FACE" ]; then
+    OUTPUT_FACE=down
+    [ "${PASS2_REVERSE:-no}" = "yes" ] && OUTPUT_FACE=up
+  fi
+  if [ -z "$RELOAD_FACE" ]; then
+    RELOAD_FACE="$OUTPUT_FACE"
+    if [ -n "${PASS1_REVERSE:-}" ] && [ "$PASS1_REVERSE" = "${PASS2_REVERSE:-}" ]; then
+      case "$OUTPUT_FACE" in down) RELOAD_FACE=up ;; up) RELOAD_FACE=down ;; esac
+    fi
+  fi
+}
 
-# Forward quality / colour / paper / tray choices from the print dialog to both
-# passes. Set to 0 if a vendor-specific option ever makes lp reject the job;
-# the queue defaults are then used instead.
-PASSTHROUGH_ENABLED=${PASSTHROUGH_ENABLED:-1}
+choose_paper() {
+  local selected rc
+  [ -x "$PLAN_HELPER" ] || fail "缺少双面打印组件。请重新安装 Print Two-Sided。"
+  selected=$("$PLAN_HELPER" choose "$1" "$PRINTER_LABEL" \
+             "$BIND_EDGE" "$OUTPUT_FACE" "$RELOAD_FACE" "$OUTPUT_HEAD" "$0" "$PRINTER" 2>>"$LOG")
+  rc=$?
+  [ "$rc" -eq 2 ] && exit 0
+  [ "$rc" -eq 0 ] || fail "无法打开双面打印设置。请查看日志。"
+  read_paper "$selected" || fail "无法读取双面打印设置。"
+  if [ "$1" = settings ]; then
+    save_config || fail "无法保存双面打印设置。"
+  fi
+}
 
-# Open the printer's queue window while printing, so macOS shows its normal Dock
-# progress. Set to 0 if you would rather nothing appeared.
-SHOW_QUEUE=${SHOW_QUEUE:-1}
-EOF
+read_paper() {
+  local selected="$1"
+  [[ "$selected" =~ ^(long|short)\ (down|up)\ (down|up)\ (inside|outside)$ ]] || return 1
+  IFS=' ' read -r BIND_EDGE OUTPUT_FACE RELOAD_FACE OUTPUT_HEAD <<<"$selected"
 }
 
 default_printer() {
@@ -315,106 +331,32 @@ Add your printer in System Settings > Printers & Scanners, then run setup again.
 }
 
 # ---------------------------------------------------------------------------
-# Page count. Three strategies, most reliable first.
-# ---------------------------------------------------------------------------
-
-page_count() {
-  local f="$1" n=""
-
-  # 1. PDFKit / CoreGraphics via JavaScript for Automation.
-  #
-  # The "-" is load-bearing: osascript treats its first non-option argument as
-  # the program file, so without it osascript tries to execute the PDF itself as
-  # a script and never reads the heredoc at all.
-  n=$(osascript -l JavaScript - "$f" 2>/dev/null <<'JXA'
-function run(argv) {
-  ObjC.import('Quartz');
-  var url = $.NSURL.fileURLWithPath(argv[0]);
-  try {
-    var doc = $.PDFDocument.alloc.initWithURL(url);
-    if (doc && !doc.isNil() && doc.pageCount > 0) { return String(doc.pageCount); }
-  } catch (e) {}
-  try {
-    var cg = $.CGPDFDocumentCreateWithURL(url);
-    if (cg) {
-      var n = $.CGPDFDocumentGetNumberOfPages(cg);
-      if (n > 0) { return String(n); }
-    }
-  } catch (e) {}
-  return '';
-}
-JXA
-  )
-  case "$n" in ''|*[!0-9]*) n="" ;; esac
-  [ -n "$n" ] && [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
-  log "page_count: JXA returned nothing for $f"
-
-  # 2. Read the page tree out of the PDF itself. Works on uncompressed page
-  # trees; returns nothing when the document uses object streams.
-  n=$(LC_ALL=C grep -a -o '/Type[[:space:]]*/Page[^s]' "$f" 2>/dev/null | wc -l | tr -d ' ')
-  case "$n" in ''|*[!0-9]*) n="" ;; esac
-  [ -n "$n" ] && [ "$n" -gt 0 ] && { log "page_count: fell back to raw scan ($n)"; printf '%s' "$n"; return 0; }
-
-  # 3. Ask, rather than guess wrong and waste a stack of paper.
-  n=$(osascript -e 'tell me to activate' \
-        -e 'display dialog "Could not read the page count automatically." & return & return & "How many pages is this document?" default answer "" with title "Two-Sided Printing"' \
-        2>/dev/null \
-        | sed 's/.*text returned://; s/,.*//')
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$n" -gt 0 ] && { printf '%s' "$n"; return 0; }
-  return 1
-}
-
-# ---------------------------------------------------------------------------
 # Printing
 # ---------------------------------------------------------------------------
 
 submit() {
-  # submit <pdf> <title> <page-ranges> [extra lp opts...]
-  local f="$1" title="$2" ranges="$3"; shift 3
+  local f="$1" title="$2" sheets="$3"
   local out jobid o
   local -a lpargs
-  lpargs=(-d "$PRINTER" -t "$title" -o "page-ranges=$ranges")
+  lpargs=(-d "$PRINTER" -t "$title")
 
-  # Copies are handled here rather than by repeating the whole flow, so there is
-  # only ever one flip. Collation is set explicitly because it must match across
-  # both passes - see the note in run_duplex.
-  if [ "${COPIES_N:-1}" -gt 1 ]; then
-    lpargs+=(-o "copies=${COPIES_N}" -o "collate=${COLLATE_V:-true}")
-  fi
-
-  # Forward the settings the user chose in the print dialog.
-  if [ "${PASSTHROUGH_ENABLED:-1}" = "1" ]; then
+  if [ "$PASSTHROUGH_ENABLED" = 1 ]; then
     while IFS= read -r o; do
       [ -n "$o" ] && lpargs+=(-o "$o")
-    done <<<"${PASSTHROUGH:-}"
+    done <<<"$PASSTHROUGH"
   fi
 
-  out=$(lp "${lpargs[@]}" "$@" -- "$f" 2>&1)
-  if [ $? -ne 0 ]; then
+  # The PDF already contains one page for each physical side in feed order.
+  lpargs+=(-n 1 -o sides=one-sided -o number-up=1 -o outputorder=normal
+    -o page-set=all -o "page-ranges=1-$sheets" -o job-sheets=none,none)
+  if ! out=$(LC_ALL=C lp "${lpargs[@]}" -- "$f" 2>&1); then
     log "lp failed: $out"
-    alert "The printer rejected the job:
-
-$out"
     return 1
   fi
   jobid=$(printf '%s' "$out" | sed -n 's/.*request id is \([^ ]*\).*/\1/p')
-  log "submitted $jobid  ranges=$ranges  opts=$*"
+  [ -n "$jobid" ] || { log "could not identify CUPS job: $out"; return 1; }
+  log "submitted $jobid ($sheets sheets)"
   printf '%s' "$jobid"
-}
-
-# How many pages a range string covers: "1-2,5-6" -> 4, "2,4,6" -> 3
-count_in_ranges() {
-  local r="$1" tot=0 part a b oldifs="$IFS"
-  IFS=','
-  for part in $r; do
-    case "$part" in
-      *-*) a="${part%%-*}"; b="${part##*-}"; tot=$(( tot + b - a + 1 )) ;;
-      *)   tot=$(( tot + 1 )) ;;
-    esac
-  done
-  IFS="$oldifs"
-  printf '%s' "$tot"
 }
 
 # Work out how long this pass could reasonably take.
@@ -475,49 +417,6 @@ printer_alert() {
   return 0
 }
 
-# Set by wait_for_job when it gives up, so the prompt can name the fault.
-WAIT_REASON=""
-
-wait_for_job() {
-  # Block until the job leaves the queue, so the flip prompt does not appear
-  # while pages are still feeding.
-  # <jobid> [budget_seconds]
-  local jobid="$1" budget="${2:-1800}" waited=0
-  WAIT_REASON=""
-  [ -z "$jobid" ] && { sleep 5; return 0; }
-  while lpstat -W not-completed -o "$PRINTER" 2>/dev/null | grep -q "^$jobid "; do
-    sleep 2
-    waited=$((waited + 2))
-
-    # Check what the printer is reporting. Out of paper, a jam or an open cover
-    # will never clear on their own, so say so straight away instead of sitting
-    # out the whole budget in silence.
-    if [ $((waited % 10)) -eq 0 ]; then
-      WAIT_REASON=$(printer_alert)
-      if [ -n "$WAIT_REASON" ]; then
-        log "printer reports: $WAIT_REASON (waiting for $jobid)"
-        return 1
-      fi
-      if lpstat -p "$PRINTER" 2>/dev/null | grep -qi "disabled\|stopped"; then
-        WAIT_REASON="the queue has stopped"
-        log "printer is stopped/disabled while waiting for $jobid"
-        return 1
-      fi
-    fi
-
-    # Log progress so a slow job is visibly progressing rather than looking hung.
-    [ $((waited % 60)) -eq 0 ] && log "still waiting on $jobid (${waited}s of ${budget}s)"
-
-    if [ "$waited" -ge "$budget" ]; then
-      log "job $jobid still queued after ${waited}s (budget ${budget}s) - asking the user"
-      return 1
-    fi
-  done
-  # Give the mechanism a moment to finish ejecting the final sheet.
-  sleep 3
-  return 0
-}
-
 # ---------------------------------------------------------------------------
 # Print-settings passthrough
 #
@@ -556,7 +455,8 @@ opt_is_allowed() {
   case "$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" in
     # page selection and ordering - this tool controls these
     page-ranges|page-set|page-label|outputorder|output-order|copies|collate|\
-    sides|multiple-document-handling) return 1 ;;
+    number-up|number-up-layout|page-border|orientation-requested|landscape|\
+    skip-blank-*|suppress-blank-*|blankpageskip|sides|multiple-document-handling) return 1 ;;
     # duplex of any flavour: the printer has no duplexer
     *duplex*|*tumble*|booklet*) return 1 ;;
     # job bookkeeping and routing, not print settings
@@ -598,97 +498,6 @@ opt_value() {
   return 1
 }
 
-# ---------------------------------------------------------------------------
-# Page ranges
-#
-# Split by *sheet side*, not by document page. With N-up layout, K document
-# pages share one side, so sheet i covers pages (i-1)*K+1 .. i*K. With the
-# usual K=1 this degenerates to the plain 1,3,5 / 2,4,6 split.
-# ---------------------------------------------------------------------------
-
-side_ranges() {
-  # side_ranges <pages> <number-up> <odd|even>
-  local pages="$1" k="$2" parity="$3"
-  local sides start end i out=""
-  [ "$k" -lt 1 ] && k=1
-  sides=$(( (pages + k - 1) / k ))
-
-  i=1
-  [ "$parity" = "even" ] && i=2
-  while [ "$i" -le "$sides" ]; do
-    start=$(( (i - 1) * k + 1 ))
-    end=$(( i * k ))
-    [ "$end" -gt "$pages" ] && end="$pages"
-    if [ "$start" -eq "$end" ]; then
-      out="${out}${start},"
-    else
-      out="${out}${start}-${end},"
-    fi
-    i=$(( i + 2 ))
-  done
-  [ -z "$out" ] && return 1
-  printf '%s' "${out%,}"
-}
-
-# Append blank pages to a copy of the document.
-#
-# An odd-sided document needs one more sheet than the first pass prints, and lp
-# cannot feed a sheet for a page that does not exist. Rather than asking you to
-# add paper by hand, append a real blank page: the printer then feeds and ejects
-# that sheet itself, and the second pass prints on its back.
-#
-# Uses PDFKit through JavaScript for Automation - part of macOS, nothing to
-# install. Blank pages are sized to match the last real page.
-pad_pdf() {
-  # pad_pdf <src> <dst> <count>  -> prints OK, or ERR ...
-  osascript -l JavaScript - "$1" "$2" "$3" 2>&1 <<'JXA'
-function run(argv) {
-  ObjC.import('Quartz');
-  var n = parseInt(argv[2], 10);
-  if (!(n > 0)) { return 'ERR bad count'; }
-
-  var doc = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(argv[0]));
-  if (!doc || doc.isNil()) { return 'ERR cannot open source'; }
-  var count = doc.pageCount;
-  if (count < 1) { return 'ERR source has no pages'; }
-
-  var bounds = doc.pageAtIndex(count - 1).boundsForBox($.kPDFDisplayBoxMediaBox);
-  for (var i = 0; i < n; i++) {
-    var blank = $.PDFPage.alloc.init;
-    if (!blank || blank.isNil()) { return 'ERR cannot create blank page'; }
-    blank.setBoundsForBox(bounds, $.kPDFDisplayBoxMediaBox);
-    doc.insertPageAtIndex(blank, doc.pageCount);
-  }
-  if (!doc.writeToFile(argv[1])) { return 'ERR write failed'; }
-  return 'OK';
-}
-JXA
-}
-
-
-# ---------------------------------------------------------------------------
-# Main duplex run
-# ---------------------------------------------------------------------------
-
-pass_submit() {
-  # pass_submit <pdf> <title> <ranges> <reverse:yes|no>
-  if [ "$4" = "yes" ]; then
-    submit "$1" "$2" "$3" -o outputorder=reverse
-  else
-    submit "$1" "$2" "$3"
-  fi
-}
-
-# Block until this side is genuinely finished: the job has left the queue AND
-# the printer reports no fault.
-#
-# The flip prompt must never appear while something is wrong - being told to
-# flip a stack that is half printed is worse than being told nothing. So while a
-# fault is present this shows a self-dismissing message instead, re-checking
-# every few seconds. Fix the printer and it carries on by itself; there is
-# nothing to click.
-#
-# Returns 0 when ready, 1 if the user chose to stop.
 # Show the native print progress.
 #
 # Jobs submitted with `lp` are ordinary CUPS jobs and do appear in the normal
@@ -777,304 +586,96 @@ Keep waiting?" "Keep Waiting" "Stop")
 }
 
 one_pass_pair() {
-  # Print one complete two-sided copy.
-  # <pdf> <title> <p1_ranges> <p1_rev> <p1_name> <p2_ranges> <p2_rev> <p2_name>
-  # <sheets> <note> <label>
-  local pdf="$1" title="$2" \
-        p1="$3" p1rev="$4" p1name="$5" \
-        p2="$6" p2rev="$7" p2name="$8" \
-        sheets="$9" note="${10}" label="${11}"
-  local jobid
+  local title="$1" sheets="$2"
+  local budget jobid prompt action face binding answer tries=0
+  budget=$(estimate_timeout "$sheets")
 
-  local budget
-  budget=$(estimate_timeout "$(( $(count_in_ranges "$p1") * ${COPIES_N:-1} ))")
-  log "pass 1: $(count_in_ranges "$p1") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
-
-  jobid=$(pass_submit "$pdf" "$title [$p1name]$label" "$p1" "$p1rev") || fail "The printer rejected the job. See the log for details."
+  jobid=$(submit "$PASS_DIR/first.pdf" "$title [双面 1/2]" "$sheets") ||
+    fail "无法确认第一趟作业的状态。请查看打印队列。"
   open_print_queue
   if ! wait_until_ready "$jobid" "$budget"; then
-    log "stopped while waiting for the first side"
-    exit 0
+    log "stopped while waiting for the first pass"
+    return 1
   fi
 
-  # Re-show the prompt if it comes back empty. An empty answer is not a Cancel -
-  # it means the Apple Event failed or timed out, and abandoning the job there
-  # would leave you holding a half-printed stack with no way to finish it.
-  local prompt answer tries=0
-  prompt="Printed $sheets sheet(s) - the $p1name.$label
+  face="已印面朝下，空白面朝上"
+  [ "$RELOAD_FACE" = "up" ] && face="已印面朝上，空白面朝下"
+  binding="长边翻转"
+  [ "$BIND_EDGE" = "short" ] && binding="短边翻转"
+  if [ "$OUTPUT_FACE" = "$RELOAD_FACE" ]; then
+    action="把纸整叠原样从上方出纸口移到下方进纸盘，不翻面、不调头。"
+  else
+    action="将整叠纸左右翻面后放回下方进纸盘。原来朝机身的那条边继续朝机身。"
+  fi
+  prompt="第一趟完成。请取出整叠 $sheets 张纸，包括空白纸。
 
-$FLIP_HINT$note
+$action
+放回时${face}。
 
-Click Continue when the paper is loaded."
+已选${binding}。放好后点「继续」，第二趟同样走 $sheets 张。"
 
   while :; do
-    answer=$(dialog "$prompt" "Continue" "Cancel")
+    answer=$(dialog "$prompt" "继续" "取消")
     case "$answer" in
-      Continue) break ;;
-      Cancel)
-        # The first pass is already on paper. Record exactly how to finish it,
-        # so cancelling costs a decision rather than a stack of sheets.
-        log "cancelled at flip prompt - to print the other side later, flip the stack and run:"
-        log "    lp -d $PRINTER -o page-ranges=$p2 $([ "$p2rev" = yes ] && echo '-o outputorder=reverse ')'<the same document>'"
-        exit 0
+      继续) break ;;
+      取消|Cancel)
+        log "cancelled at reload prompt"
+        return 1
         ;;
       *)
         tries=$((tries + 1))
-        log "flip prompt returned nothing (attempt $tries) - reshowing"
-        if [ "$tries" -ge 30 ]; then
-          log "giving up after $tries attempts; backs not printed"
-          exit 0
-        fi
+        log "reload prompt returned nothing (attempt $tries)"
+        [ "$tries" -ge 30 ] && return 1
         sleep 2
         ;;
     esac
   done
 
-  budget=$(estimate_timeout "$(( $(count_in_ranges "$p2") * ${COPIES_N:-1} ))")
-  log "pass 2: $(count_in_ranges "$p2") side(s) x ${COPIES_N:-1} copy/copies, allowing ${budget}s"
-
-  jobid=$(pass_submit "$pdf" "$title [$p2name]$label" "$p2" "$p2rev") || fail "The printer rejected the job. See the log for details."
+  jobid=$(submit "$PASS_DIR/second.pdf" "$title [双面 2/2]" "$sheets") ||
+    fail "无法确认第二趟作业的状态。请查看打印队列。"
   open_print_queue
-  wait_until_ready "$jobid" "$budget" || log "stopped while waiting for the second side"
+  wait_until_ready "$jobid" "$budget"
 }
 
 run_duplex() {
-  local pdf="$1" title="${2:-Document}"
-  local pages fronts backs sheets nup copies n note label
+  local pdf="$1" title="$2"
+  local nup layout border copies collate sheets
+  choose_paper print
 
-  pages=$(page_count "$pdf") || fail "Could not determine the page count. Nothing was printed."
-
-  # Layout and copies come from the print dialog, not from us.
-  nup=$(opt_value "${RAW_OPTS:-}" "number-up"); [ -z "$nup" ] && nup=1
-  case "$nup" in ''|*[!0-9]*) nup=1 ;; esac
-  [ "$nup" -lt 1 ] && nup=1
-
-  # Apple spells this com.apple.print.PrintSettings.PMCopies..n. rather than
-  # copies=, so fall back to digging it out of the raw dictionary.
-  copies=$(opt_value "${RAW_OPTS:-}" "copies")
+  nup=$(opt_value "$RAW_OPTS" number-up)
+  layout=$(opt_value "$RAW_OPTS" number-up-layout)
+  border=$(opt_value "$RAW_OPTS" page-border)
+  copies=$(opt_value "$RAW_OPTS" copies)
   if [ -z "$copies" ]; then
-    copies=$(printf '%s' "${RAW_OPTS:-}" \
-      | tr ' ' '\n' \
-      | sed -n 's/.*PMCopies[^=]*=\([0-9][0-9]*\).*/\1/p' | head -n1)
+    copies=$(printf '%s' "$RAW_OPTS" | tr ' ' '\n' |
+      sed -n 's/.*PMCopies[^=]*=\([0-9][0-9]*\).*/\1/p' | head -n1)
   fi
-  [ -z "$copies" ] && copies=1
-  case "$copies" in ''|*[!0-9]*) copies=1 ;; esac
-  [ "$copies" -lt 1 ] && copies=1
-
-  log "job '$title' pages=$pages nup=$nup copies=$copies printer=$PRINTER order=$PASS_ORDER rev=$PASS1_REVERSE/$PASS2_REVERSE"
-  log "  passthrough: $(printf '%s' "${PASSTHROUGH:-}" | tr '\n' ' ')"
-
-  local sides=$(( (pages + nup - 1) / nup ))
-  if [ "$sides" -lt 2 ]; then
-    if [ "$(dialog "This document only fills one side, so there is no second side to print.
-
-Print it normally?" "Print" "Cancel")" = "Print" ]; then
-      submit "$pdf" "$title" "1-$pages" >/dev/null
-    fi
-    exit 0
-  fi
-
-  # Odd number of sides? Pad the document so the printer supplies the extra
-  # sheet itself, instead of asking you to slot one in at the flip.
-  if [ $((sides % 2)) -eq 1 ]; then
-    local want_pages=$(( (sides + 1) * nup )) padded result
-    padded="${JOB_DIR}/padded-$$-$(date +%s).pdf"
-    result=$(pad_pdf "$pdf" "$padded" $(( want_pages - pages )))
-    if [ "$result" = "OK" ] && [ -s "$padded" ]; then
-      log "padded with $(( want_pages - pages )) blank page(s) - printer will eject the extra sheet"
-      PAD_FILE="$padded"
-      pdf="$padded"
-      pages="$want_pages"
-      sides=$(( (pages + nup - 1) / nup ))
-    else
-      log "could not pad ($result) - will ask for a blank sheet instead"
-    fi
-  fi
-
-  fronts=$(side_ranges "$pages" "$nup" odd)
-  backs=$(side_ranges "$pages" "$nup" even)
-
-  # Which pass runs first, and in which direction.
-  local p1 p1rev p1name p2 p2rev p2name
-  if [ "$PASS_ORDER" = "evens-first" ]; then
-    p1="$backs";  p1rev="$PASS1_REVERSE"; p1name="back sides"
-    p2="$fronts"; p2rev="$PASS2_REVERSE"; p2name="front sides"
-  else
-    p1="$fronts"; p1rev="$PASS1_REVERSE"; p1name="front sides"
-    p2="$backs";  p2rev="$PASS2_REVERSE"; p2name="back sides"
-  fi
-
-  # How many sheets each pass covers, per copy.
-  local evens_n=$(( sides / 2 )) odds_n=$(( (sides + 1) / 2 ))
-  local p1_n p2_n blanks
-  if [ "$PASS_ORDER" = "evens-first" ]; then p1_n=$evens_n; p2_n=$odds_n
-  else                                       p1_n=$odds_n;  p2_n=$evens_n
-  fi
-  sheets=$(( p1_n * copies ))
-  blanks=$(( (p2_n - p1_n) * copies ))
-  [ "$blanks" -lt 0 ] && blanks=0
-
-  # Copies go in a single pass, so there is only ever one flip. That is safe
-  # because the copies are identical: reversing the whole job produces the same
-  # sequence as reversing within each copy.
-  #
-  # Collation must match across both passes, and for an odd-page document with
-  # more than one copy it must be OFF. Collated output groups each copy
-  # together, which bunches all the blank sheets at the top instead of one per
-  # copy; uncollated groups by sheet, so the blanks land where they belong.
-  COPIES_N="$copies"
-  COLLATE_V="true"
-  [ "$blanks" -gt 0 ] && [ "$copies" -gt 1 ] && COLLATE_V="false"
-
-  note=""
-  if [ "$blanks" -gt 0 ]; then
-    note="
-
-Could not add a blank page automatically, so this pass needs $blanks more sheet(s) than the last one printed. Add $blanks blank sheet(s) on TOP of the stack before continuing."
-  fi
-
-  local label=""
-  [ "$copies" -gt 1 ] && label="  ($copies copies)"
-
-  one_pass_pair "$pdf" "$title" \
-                "$p1" "$p1rev" "$p1name" \
-                "$p2" "$p2rev" "$p2name" \
-                "$sheets" "$note" "$label"
-
-  log "job '$title' complete"
-  exit 0
-}
-
-# ---------------------------------------------------------------------------
-# Calibration - works out this printer's stacking convention once
-# ---------------------------------------------------------------------------
-
-make_test_pdf() {
-  # Writes a valid 4-page PDF (one big numeral per page) to $1.
-  # Built by hand so there is nothing to install; xref offsets are computed
-  # from the actual byte lengths rather than assumed.
-  local out="$1"
-  local -a objs
-  local i n label
-
-  objs[1]='<< /Type /Catalog /Pages 2 0 R >>'
-  objs[2]='<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 >>'
-
-  n=3
-  for i in 1 2 3 4; do
-    case $i in
-      1) label='FRONT of sheet 1  (page 1)' ;;
-      2) label='BACK of sheet 1  (page 2)' ;;
-      3) label='FRONT of sheet 2  (page 3)' ;;
-      4) label='BACK of sheet 2  (page 4)' ;;
-    esac
-    objs[$n]="<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 11 0 R >> >> /Contents $((n+1)) 0 R >>"
-    local stream="BT /F1 200 Tf 240 430 Td ($i) Tj ET
-BT /F1 16 Tf 90 340 Td ($label) Tj ET
-BT /F1 12 Tf 90 300 Td (manual-duplex calibration sheet) Tj ET"
-    objs[$((n+1))]="<< /Length ${#stream} >>
-stream
-${stream}
-endstream"
-    n=$((n+2))
-  done
-  objs[11]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
-
-  # Emit, recording the byte offset of each object as we go.
-  local -a offsets
-  : >"$out"
-  # Octal escapes rather than \xHH: portable back to bash 3.2's printf.
-  printf '%%PDF-1.4\n%%\342\343\317\323\n' >>"$out"
-  for i in $(seq 1 11); do
-    offsets[$i]=$(wc -c <"$out" | tr -d ' ')
-    printf '%d 0 obj\n%s\nendobj\n' "$i" "${objs[$i]}" >>"$out"
-  done
-
-  local startxref
-  startxref=$(wc -c <"$out" | tr -d ' ')
-  {
-    printf 'xref\n0 12\n'
-    printf '0000000000 65535 f \n'
-    for i in $(seq 1 11); do printf '%010d 00000 n \n' "${offsets[$i]}"; done
-    printf 'trailer\n<< /Size 12 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' "$startxref"
-  } >>"$out"
-}
-
-calibrate() {
-  local tmp="${TMPDIR:-/tmp}/manual-duplex-calibration.pdf"
-  make_test_pdf "$tmp"
-
-  [ "$(dialog "Calibration prints 2 sheets to work out how your printer stacks paper. You only ever do this once.
-
-Load at least 2 sheets, then click Start." "Start" "Cancel")" = "Start" ] || exit 0
-
-  # Calibrate whichever mode is configured, so the answer applies to real jobs.
-  local jobid p1 p2 p1n p2n key partner other
-  if [ "$PASS_ORDER" = "evens-first" ]; then
-    p1="2,4"; p1n="back sides";  p2="1,3"; p2n="front sides"
-    key="2"; partner="1"; other="3"
-  else
-    p1="1,3"; p1n="front sides"; p2="2,4"; p2n="back sides"
-    key="1"; partner="2"; other="4"
-  fi
-
-  jobid=$(pass_submit "$tmp" "Duplex calibration [$p1n]" "$p1" "$PASS1_REVERSE") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid" "$(estimate_timeout 2)"
-
-  [ "$(dialog "You should now have 2 sheets, printed on one side.
-
-$FLIP_HINT
-
-Click Continue when loaded." "Continue" "Cancel")" = "Continue" ] || exit 0
-
-  jobid=$(pass_submit "$tmp" "Duplex calibration [$p2n]" "$p2" "yes") || fail "The printer rejected the job. See the log for details."
-  wait_for_job "$jobid" "$(estimate_timeout 2)"
-
-  # One question tells us whether the sheets fed back in the order the second
-  # pass assumed. That is the only thing that varies between printers.
-  local answer
-  answer=$(dialog "Find the sheet with $key on it.
-
-What is printed on the other side of it?" "$partner" "$other")
-
-  case "$answer" in
-    "$partner") PASS2_REVERSE="yes" ;;
-    "$other")   PASS2_REVERSE="no"  ;;
-    *) exit 0 ;;
+  collate=$(opt_value "$RAW_OPTS" collate)
+  case "$(printf '%s' "$collate" | tr '[:upper:]' '[:lower:]')" in
+    false|off|no|0) collate=false ;;
+    *) collate=true ;;
   esac
 
-  save_config
-  rm -f "$tmp"
-  alert "Calibrated.
+  PASS_DIR=$(mktemp -d "$JOB_DIR/pass.XXXXXX") || fail "无法创建打印临时目录。"
+  if ! sheets=$("$PLAN_HELPER" prepare "$pdf" "$PASS_DIR" \
+      "$BIND_EDGE" "$OUTPUT_FACE" "$RELOAD_FACE" "$OUTPUT_HEAD" \
+      "${nup:-1}" "${layout:-lrtb}" "${border:-none}" "${copies:-1}" "$collate" 2>&1); then
+    fail "无法生成两趟等张数的打印作业。
 
-Print anything, choose PDF > Print Two-Sided, and follow the prompt."
+$sheets"
+  fi
+  case "$sheets" in ''|*[!0-9]*|0) fail "两趟打印张数校验失败。" ;; esac
+
+  log "job '$title': $sheets sheets per pass, edge=$BIND_EDGE output=$OUTPUT_FACE reload=$RELOAD_FACE head=$OUTPUT_HEAD"
+  log "  passthrough: $(printf '%s' "$PASSTHROUGH" | tr '\n' ' ')"
+  if one_pass_pair "$title" "$sheets"; then
+    log "job '$title' complete"
+  fi
 }
 
 setup() {
-  if [ "$(dialog "Two-Sided Printing lets a printer with no duplexer print on both sides.
-
-It prints the fronts, waits while you flip the stack, then prints the backs.
-
-Two quick questions and you are set up." "Get Started" "Cancel")" != "Get Started" ]; then
-    exit 0
-  fi
-
   pick_printer
-  save_config
-
-  if [ "$(dialog "Printer: $PRINTER_LABEL
-
-Now a 2-sheet calibration, to work out which way your printer stacks paper.
-
-Skipping means the first real job may come out back-to-front - which is the one mistake this tool exists to prevent." "Calibrate" "Skip")" = "Calibrate" ]; then
-    calibrate
-  else
-    alert "Saved.
-
-Print anything, choose PDF > Print Two-Sided, and follow the prompt.
-
-Run calibration later with:  manual-duplex --calibrate"
-  fi
+  choose_paper settings
 }
 
 # Terminal-facing health check. Answers the question "I pressed Print and
@@ -1114,7 +715,8 @@ doctor() {
   local app="${HOME}/Applications/Two-Sided Printing.app"
   if [ -d "$app" ]; then
     echo "$ok installed at ~/Applications/Two-Sided Printing.app"
-    [ -x "$app/Contents/MacOS/applet" ] \
+    t=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null)
+    [ -n "$t" ] && [ -x "$app/Contents/MacOS/$t" ] \
       && echo "$ok bundle executable present" \
       || echo "$bad bundle looks incomplete - reinstall"
   else
@@ -1147,36 +749,18 @@ doctor() {
     echo "$warn none configured - run: manual-duplex --setup"
   elif lpstat -p "$PRINTER" >/dev/null 2>&1; then
     echo "$ok $PRINTER_LABEL ($PRINTER)"
-    echo "       order=$PASS_ORDER  pass1_rev=$PASS1_REVERSE  pass2_rev=$PASS2_REVERSE"
+    echo "       binding=$BIND_EDGE  output=$OUTPUT_FACE  reload=$RELOAD_FACE  head=$OUTPUT_HEAD"
   else
     echo "$bad configured queue '$PRINTER' is not available"
   fi
 
   echo
-  echo "Handoff test (simulates exactly what the print dialog does)"
-  if [ ! -x "$svc" ]; then
-    echo "$bad skipped - PDF Service not installed"
+  echo "Paper planner"
+  if [ -x "$PLAN_HELPER" ]; then
+    echo "$ok $PLAN_HELPER"
   else
-    local tmp before after
-    tmp="${TMPDIR:-/tmp}/manual-duplex-doctor.pdf"
-    make_test_pdf "$tmp"
-    before=$( [ -f "$LOG" ] && wc -l <"$LOG" || echo 0 )
-    echo "       invoking the service with a 4-page test document..."
-    "$svc" "Doctor test" "" "$tmp" >/dev/null 2>&1
-    sleep 4
-    after=$( [ -f "$LOG" ] && wc -l <"$LOG" || echo 0 )
-    if [ "$after" -gt "$before" ]; then
-      echo "$ok the service ran and the engine started. Recent log:"
-      tail -n $(( after - before )) "$LOG" | sed 's/^/       /'
-      echo
-      echo "       If paper came out, everything works and you can print normally."
-    else
-      echo "$bad the service ran but the engine never logged anything."
-      echo "       The handoff is being killed. Reinstall with: bash install.sh"
-    fi
-    rm -f "$tmp"
+    echo "$bad missing native planner - reinstall with: bash install.sh"
   fi
-  echo
 }
 
 usage() {
@@ -1184,8 +768,8 @@ usage() {
 manual-duplex - two-sided printing for printers without a duplexer
 
   manual-duplex FILE.pdf     print a PDF two-sided
-  manual-duplex --setup      pick printer, then calibrate
-  manual-duplex --calibrate  redo calibration only
+  manual-duplex --setup      pick printer and configure paper
+  manual-duplex --paper-settings  change binding and paper orientation
   manual-duplex --printer    switch printer
   manual-duplex --status     show current settings
   manual-duplex --doctor     diagnose "nothing happened when I pressed Print"
@@ -1201,16 +785,11 @@ USAGE
 }
 
 status() {
-  local first="back sides (evens) first"
-  [ "$PASS_ORDER" = "odds-first" ] && first="front sides (odds) first"
-  alert "Printer:  ${PRINTER_LABEL:-none selected}
-Queue:  ${PRINTER:-none}
-Order:  $first
-Pass 1 reversed:  $PASS1_REVERSE
-Pass 2 reversed:  $PASS2_REVERSE
-Settings passthrough:  $([ "${PASSTHROUGH_ENABLED:-1}" = "1" ] && echo on || echo off)
-
-Print anything and choose PDF > Print Two-Sided."
+  alert "打印机  ${PRINTER_LABEL:-未设置}
+翻转  $BIND_EDGE
+出纸时已印面  $OUTPUT_FACE
+放回时已印面  $RELOAD_FACE
+出纸时页首  $OUTPUT_HEAD"
 }
 
 # ---------------------------------------------------------------------------
@@ -1224,20 +803,22 @@ if [ -n "$PRINTER" ] && [ -z "$PRINTER_LABEL" ]; then
   PRINTER_LABEL=$(printer_label "$PRINTER")
 fi
 
-# Drop keys from the older schemes and adopt the current defaults. Deliberately
-# does NOT carry the old fronts-first setting over - evens-first is the intended
-# behaviour now, and silently preserving the previous mode would mean the new
-# default never actually takes effect.
-if [ -n "${EVEN_ORDER:-}" ] || [ -n "${FRONT_ORDER:-}" ]; then
-  unset EVEN_ORDER FRONT_ORDER
-  save_config
-  log "migrated config to PASS_ORDER=$PASS_ORDER rev=$PASS1_REVERSE/$PASS2_REVERSE"
-fi
+load_paper_defaults
 
 case "${1:-}" in
-  --setup)     setup; exit 0 ;;
-  --calibrate) [ -z "$PRINTER" ] && pick_printer; calibrate; exit 0 ;;
-  --printer)   pick_printer; save_config; status; exit 0 ;;
+  --save-paper)
+    [ "$#" -eq 4 ] && [ -n "$2" ] && read_paper "$4" || exit 1
+    PRINTER="$2"
+    PRINTER_LABEL="$3"
+    save_config
+    exit $?
+    ;;
+  --setup|--printer) setup; exit 0 ;;
+  --paper-settings|--calibrate)
+    [ -z "$PRINTER" ] && pick_printer
+    choose_paper settings
+    exit 0
+    ;;
   --status)    status; exit 0 ;;
   --doctor)    doctor; exit 0 ;;
   --config)    open -t "$CONFIG" 2>/dev/null || cat "$CONFIG"; exit 0 ;;
@@ -1283,7 +864,7 @@ if [ -z "$PDF" ]; then
   if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then
     echo "manual-duplex: no PDF given." >&2
     echo "usage: manual-duplex yourfile.pdf" >&2
-    echo "       manual-duplex --doctor | --status | --setup | --calibrate" >&2
+    echo "       manual-duplex --doctor | --status | --setup | --paper-settings" >&2
   else
     log "no usable PDF in args (${*:-none}) - ignoring silently"
   fi
@@ -1297,12 +878,12 @@ esac
 
 log "started: title='$TITLE' pdf='$PDF'"
 
-[ -z "$PRINTER" ] && { pick_printer; save_config; }
+[ -z "$PRINTER" ] && pick_printer
 
 # Printer may have been removed or renamed since we saved it.
 if ! lpstat -p "$PRINTER" >/dev/null 2>&1; then
   log "configured printer '$PRINTER' is gone; reselecting"
-  pick_printer; save_config
+  pick_printer
 fi
 
 run_duplex "$PDF" "$TITLE"

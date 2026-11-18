@@ -18,6 +18,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 #   ./install.sh              install
+#   ./install.sh --update-engine  update only the engine and native planner
 #   ./install.sh --uninstall  remove everything
 #
 # Nothing here needs sudo. Everything installs into your home folder.
@@ -29,6 +30,7 @@ ENGINE_SRC="${SRC_DIR}/manual-duplex.sh"
 
 BIN_DIR="${HOME}/.local/bin"
 ENGINE="${BIN_DIR}/manual-duplex"
+PLAN_HELPER="${BIN_DIR}/manual-duplex-plan"
 SERVICES="${HOME}/Library/PDF Services"
 SERVICE="${SERVICES}/Print Two-Sided"
 APP_DIR="${HOME}/Applications"
@@ -51,11 +53,12 @@ fi
 
 # Reject stray arguments rather than silently ignoring them.
 case "${1:-}" in
-  ""|--uninstall) ;;
+  ""|--update-engine|--uninstall) ;;
   *) die "Unknown option: $1
 
 Usage:
   bash install.sh             install
+  bash install.sh --update-engine update an existing installation
   bash install.sh --uninstall remove everything" ;;
 esac
 
@@ -81,6 +84,7 @@ uninstall() {
   rm -f "$SERVICE"    && green "Removed PDF Service"
   rm -rf "$APP"       && green "Removed $APP"
   rm -f "$ENGINE"     && green "Removed $ENGINE"
+  rm -f "$PLAN_HELPER" && green "Removed $PLAN_HELPER"
   local q
   for q in $(lpstat -p 2>/dev/null | awk '/^printer/ {print $2}' | grep -- '-Two-Sided-' || true); do
     if lpadmin -x "$q" 2>/dev/null; then
@@ -100,12 +104,26 @@ uninstall() {
 
 # --- 1. the engine -----------------------------------------------------------
 
-clear_stale_launchd_jobs
-
 mkdir -p "$BIN_DIR"
-cp "$ENGINE_SRC" "$ENGINE"
-chmod 755 "$ENGINE"
-green "Installed engine  -> $ENGINE"
+install_engine() (
+  local stage
+  stage=$(mktemp -d "${BIN_DIR}/.manual-duplex.XXXXXX")
+  trap 'rm -f "$stage/manual-duplex" "$stage/manual-duplex-plan"; rmdir "$stage"' EXIT
+  if ! /usr/bin/swiftc -swift-version 5 -O -parse-as-library \
+      "${SRC_DIR}/DuplexPlan.swift" -o "$stage/manual-duplex-plan"; then
+    die "Could not build the native planner. Install the macOS Command Line Tools and retry."
+  fi
+  /bin/bash -n "$ENGINE_SRC"
+  /usr/bin/install -m 755 "$ENGINE_SRC" "$stage/manual-duplex"
+  mv -f "$stage/manual-duplex-plan" "$PLAN_HELPER"
+  mv -f "$stage/manual-duplex" "$ENGINE"
+  green "Installed engine and paper planner -> $BIN_DIR"
+)
+
+install_engine
+[ "${1:-}" = "--update-engine" ] && exit 0
+
+clear_stale_launchd_jobs
 
 # --- 1b. the icon ------------------------------------------------------------
 # Built from the shipped .iconset with iconutil, which is part of macOS. If it
@@ -153,6 +171,7 @@ if [ -f "${SRC_DIR}/app.applescript" ] && command -v osacompile >/dev/null 2>&1;
     fi
     [ -f "${CONFIG_DIR}/manual-duplex.icns" ] && \
       cp "${CONFIG_DIR}/manual-duplex.icns" "${APP}/Contents/Resources/applet.icns" 2>/dev/null || true
+    /usr/bin/codesign --force --sign - "$APP"
     # Register with LaunchServices so `open -a` finds it immediately.
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
       -f "$APP" >/dev/null 2>&1 || true
@@ -226,7 +245,7 @@ fi
 echo
 green "Installed."
 echo
-echo "Running first-time setup (pick printer + calibrate the paper flip)..."
+echo "Running first-time setup (printer and paper settings)..."
 echo
 "$ENGINE" --setup || true
 
@@ -235,9 +254,9 @@ cat <<'EOF'
 How to use it
 -------------
   In any app:  File > Print > PDF dropdown (bottom-left) > Print Two-Sided
-  Follow the prompt, flip the stack when asked, done.
+  Choose the binding edge and paper faces. Reload the stack when prompted.
 
-  Re-calibrate:  ~/.local/bin/manual-duplex --calibrate
+  Paper settings: ~/.local/bin/manual-duplex --paper-settings
   Edit settings: ~/.local/bin/manual-duplex --config
   See the log:   ~/.local/bin/manual-duplex --log
   Uninstall:     ./install.sh --uninstall
